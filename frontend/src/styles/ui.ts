@@ -1,0 +1,161 @@
+import type React from 'react'
+
+export const ui = {
+  color: {
+    bg: '#0f1117',
+    panel: '#151821',
+    panelAlt: '#1b2030',
+    panelSoft: '#202638',
+    border: '#2b3246',
+    borderStrong: '#3b4560',
+    text: '#e5e7eb',
+    muted: '#9ca3af',
+    faint: '#6b7280',
+    accent: '#f59e0b',
+    accentSoft: '#2b2617',
+    primary: '#14b8a6',
+    success: '#16a34a',
+    warning: '#d97706',
+    danger: '#dc2626',
+  },
+  radius: {
+    sm: 6,
+    md: 8,
+  },
+  font: {
+    xs: 11,
+    sm: 12,
+    md: 13,
+    base: 14,
+  },
+  space: {
+    xs: 4,
+    sm: 8,
+    md: 12,
+    lg: 16,
+  },
+} as const
+
+export const buttons: Record<'primary' | 'secondary' | 'danger' | 'ghost' | 'disabled', React.CSSProperties> = {
+  primary: {
+    background: ui.color.primary,
+    color: '#fff',
+    border: 'none',
+    borderRadius: ui.radius.sm,
+    padding: '7px 10px',
+    fontSize: ui.font.sm,
+    cursor: 'pointer',
+  },
+  secondary: {
+    background: ui.color.panelSoft,
+    color: ui.color.text,
+    border: `1px solid ${ui.color.borderStrong}`,
+    borderRadius: ui.radius.sm,
+    padding: '7px 10px',
+    fontSize: ui.font.sm,
+    cursor: 'pointer',
+  },
+  danger: {
+    background: ui.color.danger,
+    color: '#fff',
+    border: 'none',
+    borderRadius: ui.radius.sm,
+    padding: '7px 10px',
+    fontSize: ui.font.sm,
+    cursor: 'pointer',
+  },
+  ghost: {
+    background: 'transparent',
+    color: ui.color.muted,
+    border: `1px solid ${ui.color.border}`,
+    borderRadius: ui.radius.sm,
+    padding: '7px 10px',
+    fontSize: ui.font.sm,
+    cursor: 'pointer',
+  },
+  disabled: {
+    background: '#1c1f2c',
+    color: ui.color.faint,
+    border: `1px solid ${ui.color.border}`,
+    borderRadius: ui.radius.sm,
+    padding: '7px 10px',
+    fontSize: ui.font.sm,
+    cursor: 'not-allowed',
+    opacity: 0.7,
+  },
+}
+
+export const panelStates: Record<'empty' | 'loading' | 'error', React.CSSProperties> = {
+  empty: {
+    color: ui.color.faint,
+    fontSize: ui.font.sm,
+    padding: '10px 12px',
+    lineHeight: 1.45,
+    background: 'rgba(255,255,255,0.02)',
+    borderTop: `1px solid ${ui.color.border}`,
+  },
+  loading: {
+    color: ui.color.muted,
+    fontSize: ui.font.sm,
+    padding: '10px 12px',
+    lineHeight: 1.45,
+  },
+  error: {
+    color: '#fecaca',
+    fontSize: ui.font.xs,
+    marginTop: 6,
+    lineHeight: 1.45,
+    background: '#3b1d24',
+    border: '1px solid #7f1d1d',
+    borderRadius: ui.radius.sm,
+    padding: '6px 8px',
+  },
+}
+
+export const pills: Record<'base' | 'filter' | 'filterActive' | 'success' | 'warning' | 'info', React.CSSProperties> = {
+  base: {
+    borderRadius: 999,
+    padding: '2px 7px',
+    fontSize: ui.font.xs,
+    whiteSpace: 'nowrap',
+  },
+  filter: {
+    background: '#181827',
+    color: ui.color.muted,
+    border: `1px solid ${ui.color.border}`,
+    borderRadius: 999,
+    fontSize: ui.font.xs,
+    padding: '3px 8px',
+    cursor: 'pointer',
+  },
+  filterActive: {
+    background: '#312e81',
+    color: '#e0e7ff',
+    border: '1px solid #6366f1',
+    borderRadius: 999,
+    fontSize: ui.font.xs,
+    padding: '3px 8px',
+    cursor: 'pointer',
+  },
+  success: {
+    color: '#a7f3d0',
+    background: '#123326',
+    border: '1px solid #166534',
+    borderRadius: 999,
+    padding: '1px 6px',
+  },
+  warning: {
+    color: '#fde68a',
+    background: '#3a2f17',
+    border: '1px solid #854d0e',
+    borderRadius: 999,
+    padding: '1px 6px',
+  },
+  info: {
+    color: '#bfdbfe',
+    background: '#172554',
+    border: '1px solid #1d4ed8',
+    borderRadius: 999,
+    padding: '1px 6px',
+  },
+}

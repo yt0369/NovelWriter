@@ -1,0 +1,26 @@
+[project]
+name = "novelwriter"
+version = "3.0.0"
+description = "Local AI novel writing workstation"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "aiosqlite==0.20.0",
+  "pydantic>=2.12",
+  "pydantic-settings>=2.5.2",
+  "python-multipart==0.0.9",
+  "openai>=1.58.0",
+  "rapidfuzz==3.10.0",
+  "aiofiles==24.1.0",
+  "numpy>=2.2.0",
+  "httpx",
+  "uvicorn[standard]>=0.31.1",
+]
+
+[project.optional-dependencies]
+full = [
+  "sentence-transformers>=3.1.0",
+]
+
+[tool.uv]
+package = false

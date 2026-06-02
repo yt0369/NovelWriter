@@ -9,9 +9,89 @@ from api.files import _get_protection
 from core.pending_changes import (
     FileSafetyError,
     create_pending_change,
+    list_pending_changes,
     normalize_project_path,
     resolve_project_file,
 )
+
+
+def _slice_lines(content: str, start_line: int | None, end_line: int | None) -> tuple[str, dict[str, Any]]:
+    lines = content.splitlines()
+    total_lines = len(lines)
+    if start_line is None and end_line is None:
+        return content, {"total_lines": total_lines, "returned_start_line": 1 if total_lines else 0, "returned_end_line": total_lines}
+    start = max(1, int(start_line or 1))
+    end = min(total_lines, int(end_line or total_lines))
+    if end < start:
+        return "", {"total_lines": total_lines, "returned_start_line": start, "returned_end_line": end}
+    return "\n".join(lines[start - 1:end]), {
+        "total_lines": total_lines,
+        "returned_start_line": start,
+        "returned_end_line": end,
+    }
+
+
+async def _shadow_content_for_path(project_id: str, rel_path: str) -> tuple[str | None, str | None]:
+    changes = await list_pending_changes(project_id)
+    for change in changes:
+        if change.get("file_path") == rel_path:
+            return change.get("new_content", ""), change.get("id", "")
+    return None, None
+
+
+def _normalize_patch_edits(args: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_edits = args.get("edits")
+    if isinstance(raw_edits, list) and raw_edits:
+        edits = []
+        for index, raw in enumerate(raw_edits):
+            if not isinstance(raw, dict):
+                continue
+            edits.append({
+                "id": str(raw.get("id") or f"edit-{index + 1}"),
+                "old_text": str(raw.get("old_text", "")),
+                "new_text": str(raw.get("new_text", "")),
+                "replace_all": bool(raw.get("replace_all", False)),
+                "status": str(raw.get("status") or "pending"),
+            })
+        return edits
+    return [{
+        "id": "edit-1",
+        "old_text": str(args.get("old_text", "")),
+        "new_text": str(args.get("new_text", "")),
+        "replace_all": bool(args.get("replace_all", False)),
+        "status": "pending",
+    }]
+
+
+def _apply_patch_edits(original: str, edits: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    content = original
+    reports: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for edit in edits:
+        old_text = edit.get("old_text", "")
+        new_text = edit.get("new_text", "")
+        replace_all = bool(edit.get("replace_all"))
+        match_count = content.count(old_text) if old_text else 0
+        report = {
+            "id": edit["id"],
+            "match_count": match_count,
+            "replace_all": replace_all,
+            "status": "matched" if match_count else "failed",
+        }
+        if not old_text:
+            report["reason"] = "old_text 不能为空"
+            report["suggestion"] = "提供要替换的精确原文，或先 read_file 获取最新片段。"
+            failures.append(report)
+        elif match_count == 0:
+            report["reason"] = "未找到匹配文本"
+            report["suggestion"] = "先 read_file 读取目标行范围，确认 old_text 与文件内容完全一致。"
+            failures.append(report)
+        else:
+            content = content.replace(old_text, new_text) if replace_all else content.replace(old_text, new_text, 1)
+            if match_count > 1 and not replace_all:
+                report["suggestion"] = "找到多处匹配，当前只替换第一处；如需全部替换请传 replace_all=true。"
+        reports.append(report)
+    return content, reports, failures
 
 
 def get_file_tool_definitions() -> list[ToolDefinition]:
@@ -19,7 +99,12 @@ def get_file_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(function=ToolFunction(
             name="read_file",
             description="读取文件内容",
-            parameters={"type": "object", "properties": {"path": {"type": "string", "description": "文件路径"}}, "required": ["path"]},
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string", "description": "文件路径"},
+                "start_line": {"type": "integer", "description": "起始行号（可选，1-based）"},
+                "end_line": {"type": "integer", "description": "结束行号（可选，包含该行）"},
+                "include_pending": {"type": "boolean", "description": "是否优先读取同路径待审批内容（默认 true）"},
+            }, "required": ["path"]},
         )),
         ToolDefinition(function=ToolFunction(
             name="write_file",
@@ -36,7 +121,14 @@ def get_file_tool_definitions() -> list[ToolDefinition]:
                 "path": {"type": "string", "description": "文件路径"},
                 "old_text": {"type": "string", "description": "要替换的原文"},
                 "new_text": {"type": "string", "description": "替换后的内容"},
-            }, "required": ["path", "old_text", "new_text"]},
+                "replace_all": {"type": "boolean", "description": "是否替换全部匹配，默认只替换第一处"},
+                "edits": {"type": "array", "description": "批量替换列表。提供后优先使用 edits，每项包含 id/old_text/new_text/replace_all。", "items": {"type": "object", "properties": {
+                    "id": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                }}},
+            }, "required": ["path"]},
         )),
         ToolDefinition(function=ToolFunction(
             name="glob",
@@ -82,7 +174,22 @@ async def execute_file_tool(tool_call: ToolCall, project_id: str) -> ToolResult:
             if not file_path.exists():
                 return ToolResult(status=ToolResultStatus.ERROR, tool_name=name, error=f"文件不存在: {rel_path}")
             content = file_path.read_text(encoding="utf-8")
-            return ToolResult(status=ToolResultStatus.EXECUTED, tool_name=name, result={"path": rel_path, "content": content})
+            source = "disk"
+            pending_change_id = ""
+            if args.get("include_pending", True):
+                shadow_content, shadow_id = await _shadow_content_for_path(project_id, rel_path)
+                if shadow_content is not None:
+                    content = shadow_content
+                    source = "pending_shadow"
+                    pending_change_id = shadow_id or ""
+            sliced, line_meta = _slice_lines(content, args.get("start_line"), args.get("end_line"))
+            return ToolResult(status=ToolResultStatus.EXECUTED, tool_name=name, result={
+                "path": rel_path,
+                "content": sliced,
+                "source": source,
+                "pending_change_id": pending_change_id,
+                **line_meta,
+            })
 
         elif name == "write_file":
             rel_path, file_path = resolve_project_file(project_id, args["path"])
@@ -122,16 +229,20 @@ async def execute_file_tool(tool_call: ToolCall, project_id: str) -> ToolResult:
             if protection == "AUTO_REBUILD":
                 return ToolResult(status=ToolResultStatus.ERROR, tool_name=name, error=f"文件 {rel_path} 受AUTO_REBUILD保护，禁止AI修改")
 
-            old_text = args["old_text"]
-            new_text = args["new_text"]
+            edits = _normalize_patch_edits(args)
             if not file_path.exists():
                 return ToolResult(status=ToolResultStatus.ERROR, tool_name=name, error=f"文件不存在: {rel_path}")
 
             original = file_path.read_text(encoding="utf-8")
-            if old_text not in original:
-                return ToolResult(status=ToolResultStatus.ERROR, tool_name=name, error=f"未找到匹配文本")
+            patched, patch_report, failures = _apply_patch_edits(original, edits)
+            if failures:
+                return ToolResult(
+                    status=ToolResultStatus.ERROR,
+                    tool_name=name,
+                    error="; ".join(f"{item['id']}: {item.get('reason', '替换失败')}" for item in failures),
+                    result={"patch_report": patch_report, "failures": failures},
+                )
 
-            patched = original.replace(old_text, new_text, 1)
             pending_change = await create_pending_change(
                 project_id=project_id,
                 tool_name=name,
@@ -139,6 +250,7 @@ async def execute_file_tool(tool_call: ToolCall, project_id: str) -> ToolResult:
                 original_content=original,
                 new_content=patched,
                 description=f"替换文件内容: {rel_path}",
+                metadata={"edits": edits, "patch_report": patch_report},
             )
             return ToolResult(
                 status=ToolResultStatus.APPROVAL_REQUIRED,

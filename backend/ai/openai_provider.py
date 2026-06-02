@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from typing import AsyncIterator, Any
 from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIConnectionError, APIStatusError
 
@@ -131,6 +132,44 @@ def _parse_tool_args(raw_args) -> dict:
     return {"_raw": raw_args}
 
 
+def _normalize_system_messages(messages: list[dict]) -> list[dict]:
+    """OpenAI-compatible APIs require a single leading system message."""
+    system_contents: list[str] = []
+    first_system: dict | None = None
+    normalized: list[dict] = []
+
+    for msg in messages:
+        if msg.get("role") != "system":
+            normalized.append(msg)
+            continue
+
+        if first_system is None:
+            first_system = msg
+
+        content = msg.get("content")
+        if not content:
+            continue
+        if isinstance(content, str):
+            system_contents.append(content)
+        else:
+            import json as _json
+            system_contents.append(_json.dumps(content, ensure_ascii=False))
+
+    if not system_contents:
+        return normalized
+
+    system_msg = {**(first_system or {}), "role": "system", "content": "\n\n".join(system_contents)}
+    return [system_msg] + normalized
+
+
+def _empty_choices_error(response) -> RuntimeError:
+    message = getattr(response, "message", None) or getattr(response, "error", None) or str(response)
+    code = getattr(response, "code", None)
+    if code:
+        message = f"{message} ({code})"
+    return RuntimeError(f"模型响应没有 choices：{message}")
+
+
 class OpenAIProvider(AIProvider):
     def __init__(self):
         self._client: AsyncOpenAI | None = None
@@ -152,6 +191,7 @@ class OpenAIProvider(AIProvider):
 
     async def chat_stream_events(self, messages: list[dict], temperature: float = 0.7) -> AsyncIterator[dict[str, str]]:
         client = self._get_client()
+        messages = _normalize_system_messages(messages)
 
         async def _create_stream():
             return await client.chat.completions.create(
@@ -183,6 +223,7 @@ class OpenAIProvider(AIProvider):
 
     async def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int | None = None) -> str:
         client = self._get_client()
+        messages = _normalize_system_messages(messages)
 
         async def _create():
             kwargs: dict[str, Any] = {
@@ -207,6 +248,7 @@ class OpenAIProvider(AIProvider):
         max_tokens: int = 4096,
     ) -> dict[str, Any]:
         client = self._get_client()
+        messages = _normalize_system_messages(messages)
 
         # 检测模型是否支持 function calling
         # 已知不支持的模型
@@ -230,7 +272,7 @@ class OpenAIProvider(AIProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-            print(f"[DEBUG] chat_with_tools: {len(tools)} tools, model={settings.model}")
+            logger.debug("chat_with_tools: %s tools, model=%s", len(tools), settings.model)
 
         # SkyClaw 特殊参数
         if "skyclaw" in model_lower:
@@ -245,10 +287,15 @@ class OpenAIProvider(AIProvider):
 
         response = await _retry_with_backoff(_create)
         if not response.choices:
-            print(f"[DEBUG] No choices in response: {response}")
-            return {"content": "", "reasoning_content": "", "tool_calls": None, "finish_reason": None}
+            logger.warning("chat_with_tools returned no choices: %s", response)
+            raise _empty_choices_error(response)
         msg = response.choices[0].message
-        print(f"[DEBUG] raw_msg: content={repr(msg.content)[:300]}, tool_calls={msg.tool_calls}, finish={response.choices[0].finish_reason}")
+        logger.debug(
+            "raw_msg: content=%s, tool_calls=%s, finish=%s",
+            repr(msg.content)[:300],
+            msg.tool_calls,
+            response.choices[0].finish_reason,
+        )
 
         tool_calls = None
         if msg.tool_calls:
@@ -277,7 +324,7 @@ class OpenAIProvider(AIProvider):
         # BlazeAI 适配：从 content 中提取嵌入式 tool_calls
         from ai.blazeai_adapter import adapt_response, is_blazeai
         if is_blazeai(settings.api_base_url) and not tool_calls and content and '"tool_calls"' in content:
-            print(f"[DEBUG] BlazeAI adapter: extracting tool_calls from content")
+            logger.debug("BlazeAI adapter: extracting tool_calls from content")
         result = adapt_response(result, settings.api_base_url)
 
         # 回退：如果 function calling 失败且 content 暗示工具不可用，尝试嵌入式工具
@@ -285,7 +332,7 @@ class OpenAIProvider(AIProvider):
             tool_not_exist_patterns = ["does not exist", "不可用", "无法调用", "工具调用异常", "Tool.*not.*available"]
             import re
             if any(re.search(p, content, re.IGNORECASE) for p in tool_not_exist_patterns):
-                print(f"[DEBUG] Function calling failed, falling back to embedded tools")
+                logger.debug("Function calling failed, falling back to embedded tools")
                 return await self._chat_with_tools_embedded(messages, tools, temperature, max_tokens)
 
         return result
@@ -299,6 +346,7 @@ class OpenAIProvider(AIProvider):
     ) -> dict[str, Any]:
         """不支持 function calling 的模型：将工具嵌入 system prompt，让 LLM 输出 JSON 工具调用。"""
         import json as _json
+        messages = _normalize_system_messages(messages)
 
         # 构建工具描述（简化版）
         tool_lines = []
@@ -346,21 +394,19 @@ class OpenAIProvider(AIProvider):
 2. 不需要工具时直接回复文字
 3. 参数值必须是字符串"""
 
-        # 注入到 messages 中
+        # 注入到唯一的首位 system prompt 中，避免严格模型拒绝中间 system message。
         enhanced_messages = []
-        for msg in messages:
-            if msg.get("role") == "system":
-                enhanced_messages.append({**msg, "content": msg["content"] + "\n\n" + tool_prompt})
-            else:
-                enhanced_messages.append(msg)
-        if not any(m.get("role") == "system" for m in messages):
-            enhanced_messages.insert(0, {"role": "system", "content": tool_prompt})
+        if messages and messages[0].get("role") == "system":
+            enhanced_messages.append({**messages[0], "content": messages[0].get("content", "") + "\n\n" + tool_prompt})
+            enhanced_messages.extend(messages[1:])
+        else:
+            enhanced_messages = [{"role": "system", "content": tool_prompt}] + messages
 
-        print(f"[DEBUG] chat_with_tools_embedded: {len(tools)} tools embedded in prompt, model={settings.model}")
+        logger.debug("chat_with_tools_embedded: %s tools embedded in prompt, model=%s", len(tools), settings.model)
 
         # 调试：打印工具列表
         tool_names = [t.get("function", t).get("name", "") for t in tools]
-        print(f"[DEBUG] embedded_tools: {tool_names}")
+        logger.debug("embedded_tools: %s", tool_names)
 
         client = self._get_client()
         kwargs = {
@@ -375,14 +421,15 @@ class OpenAIProvider(AIProvider):
 
         response = await _retry_with_backoff(_create)
         if not response.choices:
-            print(f"[DEBUG] embedded: No choices in response")
-            return {"content": "", "reasoning_content": "", "tool_calls": None, "finish_reason": None}
+            logger.warning("embedded tool chat returned no choices: %s", response)
+            raise _empty_choices_error(response)
         msg = response.choices[0].message
         content = msg.content or ""
+        tool_calls = None
 
         # 调试：打印 LLM 输出
-        print(f"[DEBUG] embedded_raw: content_len={len(content)}, finish={response.choices[0].finish_reason}")
-        print(f"[DEBUG] embedded_content (first 500): {content[:500]}")
+        logger.debug("embedded_raw: content_len=%s, finish=%s", len(content), response.choices[0].finish_reason)
+        logger.debug("embedded_content first 500 chars: %s", content[:500])
         json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
         if json_match:
             try:

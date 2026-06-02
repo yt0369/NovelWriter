@@ -171,6 +171,19 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_cm_session ON chat_messages(session_id, timestamp);
 
+-- Active/completed questionnaires created by ask_questions
+CREATE TABLE IF NOT EXISTS questionnaires (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    questions TEXT NOT NULL,
+    answers TEXT DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_q_project_session_status ON questionnaires(project_id, session_id, status, updated_at);
+
 -- File Versions
 CREATE TABLE IF NOT EXISTS file_versions (
     id TEXT PRIMARY KEY,
@@ -191,6 +204,7 @@ CREATE TABLE IF NOT EXISTS pending_changes (
     original_content TEXT NOT NULL,
     new_content TEXT NOT NULL,
     description TEXT,
+    metadata TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     source TEXT NOT NULL DEFAULT 'agent',
     created_at INTEGER NOT NULL,
@@ -276,6 +290,26 @@ CREATE TABLE IF NOT EXISTS project_skill_settings (
     updated_at INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pss_project_skill ON project_skill_settings(project_id, skill_id);
+
+-- Third-party skill packages installed outside the built-in skill catalog
+CREATE TABLE IF NOT EXISTS external_skills (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    description TEXT NOT NULL,
+    author TEXT,
+    entry TEXT NOT NULL,
+    permissions TEXT NOT NULL DEFAULT '[]',
+    keywords TEXT NOT NULL DEFAULT '[]',
+    min_app_version TEXT,
+    source_type TEXT NOT NULL,
+    source_url TEXT,
+    install_path TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_external_skills_enabled ON external_skills(enabled, updated_at);
 
 -- Global Settings
 CREATE TABLE IF NOT EXISTS global_settings (

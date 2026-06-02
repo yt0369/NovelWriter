@@ -12,6 +12,15 @@ interface Props {
   projectId: string
 }
 
+async function readApiError(res: Response, fallback: string) {
+  try {
+    const data = await res.json()
+    return data.detail || data.error || fallback
+  } catch {
+    return fallback
+  }
+}
+
 export function MarkdownEditor({ projectId }: Props) {
   const { activeFilePath, activeContent, isDirty, setActiveContent, setIsDirty, setActiveFile, diffMode, activePendingChange, setDiffMode } = useEditorStore()
   const [saving, setSaving] = useState(false)
@@ -20,6 +29,8 @@ export function MarkdownEditor({ projectId }: Props) {
   const [viewMode, setViewMode] = useState<'edit' | 'preview' | 'split'>('edit')
   const [scrollTop, setScrollTop] = useState(0)
   const [showSearch, setShowSearch] = useState(false)
+  const [pendingAction, setPendingAction] = useState<'approve' | 'reject' | null>(null)
+  const [pendingActionMessage, setPendingActionMessage] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastSavedContent = useRef<string>('')
@@ -87,6 +98,11 @@ export function MarkdownEditor({ projectId }: Props) {
   }, [activeFilePath])
 
   useEffect(() => {
+    setPendingAction(null)
+    setPendingActionMessage('')
+  }, [activePendingChange?.id])
+
+  useEffect(() => {
     const handler = async (event: Event) => {
       const detail = (event as CustomEvent<WorkspaceRefreshDetail>).detail
       if (!activeFilePath) return
@@ -139,6 +155,69 @@ export function MarkdownEditor({ projectId }: Props) {
     }, 0)
   }
 
+  const handlePendingEditStatusChange = async (editId: string, status: 'accepted' | 'rejected' | 'pending') => {
+    if (!activePendingChange) return
+    const res = await fetch(`/api/agent/${projectId}/pending-changes/${activePendingChange.id}/edits/${editId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    })
+    if (!res.ok) return
+    const updated = await res.json()
+    setDiffMode(updated)
+    emitPendingUpdated('pending-revised')
+  }
+
+  const handleApprovePendingChange = useCallback(async () => {
+    if (!activePendingChange || pendingAction) return
+    const change = activePendingChange
+    setPendingAction('approve')
+    setPendingActionMessage('正在批准并写入文件...')
+    try {
+      const res = await fetch(`/api/agent/${projectId}/pending-changes/${change.id}/approve`, { method: 'POST' })
+      if (res.ok || res.status === 404) {
+        const data = res.ok ? await res.json().catch(() => ({})) : {}
+        const filePath = (data.file_path as string) || change.file_path
+        setPendingActionMessage('已批准，正在刷新文件...')
+        emitFileUpdated(filePath)
+        emitPendingUpdated('pending-approved')
+        setDiffMode(null)
+        setPendingAction(null)
+        setPendingActionMessage('')
+        return
+      }
+      const error = await readApiError(res, '未知错误')
+      setPendingActionMessage(`批准失败: ${error}`)
+    } catch {
+      setPendingActionMessage('批准失败: 网络或后端异常')
+    } finally {
+      setPendingAction(null)
+    }
+  }, [activePendingChange, pendingAction, projectId, setDiffMode])
+
+  const handleRejectPendingChange = useCallback(async () => {
+    if (!activePendingChange || pendingAction) return
+    const change = activePendingChange
+    setPendingAction('reject')
+    setPendingActionMessage('正在拒绝变更...')
+    try {
+      const res = await fetch(`/api/agent/${projectId}/pending-changes/${change.id}/reject`, { method: 'POST' })
+      if (res.ok || res.status === 404) {
+        emitPendingUpdated('pending-rejected')
+        setDiffMode(null)
+        setPendingAction(null)
+        setPendingActionMessage('')
+        return
+      }
+      const error = await readApiError(res, '未知错误')
+      setPendingActionMessage(`拒绝失败: ${error}`)
+    } catch {
+      setPendingActionMessage('拒绝失败: 网络或后端异常')
+    } finally {
+      setPendingAction(null)
+    }
+  }, [activePendingChange, pendingAction, projectId, setDiffMode])
+
   const fileName = activeFilePath?.split('/').pop() || activeFilePath || ''
   const chapterName = fileName.replace(/\.md$/, '')
 
@@ -158,35 +237,12 @@ export function MarkdownEditor({ projectId }: Props) {
           <DiffViewer
             diff={activePendingChange.diff}
             filePath={activePendingChange.file_path}
-            onApprove={async () => {
-              if (!confirm(`确定批准变更？\n文件: ${activePendingChange.file_path}`)) {
-                return
-              }
-              try {
-                const res = await fetch(`/api/agent/${projectId}/pending-changes/${activePendingChange.id}/approve`, { method: 'POST' })
-                if (res.ok || res.status === 404) {
-                  // 404 说明已经被批准过了
-                  emitFileUpdated(activePendingChange.file_path)
-                  emitPendingUpdated('pending-approved')
-                  setDiffMode(null)
-                } else {
-                  const err = await res.json().catch(() => ({}))
-                  console.error('[approve] failed:', res.status, err)
-                }
-              } catch (e) {
-                console.error('[approve] error:', e)
-              }
-            }}
-            onReject={async () => {
-              if (!confirm(`确定拒绝变更？\n文件: ${activePendingChange.file_path}`)) {
-                return
-              }
-              try {
-                await fetch(`/api/agent/${projectId}/pending-changes/${activePendingChange.id}/reject`, { method: 'POST' })
-              } catch {}
-              emitPendingUpdated('pending-rejected')
-              setDiffMode(null)
-            }}
+            edits={activePendingChange.metadata?.edits}
+            actionBusy={!!pendingAction}
+            actionMessage={pendingActionMessage}
+            onEditStatusChange={handlePendingEditStatusChange}
+            onApprove={handleApprovePendingChange}
+            onReject={handleRejectPendingChange}
           />
         </div>
       </div>
@@ -244,26 +300,12 @@ export function MarkdownEditor({ projectId }: Props) {
             <DiffViewer
               diff={activePendingChange.diff}
               filePath={activePendingChange.file_path}
-              onApprove={async () => {
-                try {
-                  const res = await fetch(`/api/agent/${projectId}/pending-changes/${activePendingChange.id}/approve`, { method: 'POST' })
-                  if (res.ok) {
-                    emitFileUpdated(activePendingChange.file_path)
-                    emitPendingUpdated('pending-approved')
-                    setDiffMode(null)
-                  } else {
-                    const err = await res.json().catch(() => ({}))
-                    console.error('[approve] failed:', res.status, err)
-                  }
-              } catch (e) {
-                console.error('[approve] error:', e)
-              }
-            }}
-            onReject={async () => {
-              await fetch(`/api/agent/${projectId}/pending-changes/${activePendingChange.id}/reject`, { method: 'POST' })
-              emitPendingUpdated('pending-rejected')
-              setDiffMode(null)
-            }}
+              edits={activePendingChange.metadata?.edits}
+              actionBusy={!!pendingAction}
+              actionMessage={pendingActionMessage}
+              onEditStatusChange={handlePendingEditStatusChange}
+              onApprove={handleApprovePendingChange}
+              onReject={handleRejectPendingChange}
           />
           </div>
         )}

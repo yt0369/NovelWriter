@@ -1,13 +1,16 @@
 import json
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.agent.intent import build_intent_preview, classify_agent_intent
-from core.agent.engine import run_agent
+from core.agent.engine import _sanitize_user_visible_content, run_agent
+from core.agent.tool_runner import ToolRunner
+from models.tools import ToolCall, ToolResult, ToolResultStatus
 from support import ProjectTestCase
 
 
@@ -226,6 +229,115 @@ class MissingFileQuestionnaireProvider:
         return {"content": "无法继续。", "tool_calls": None}
 
 
+class ChapterDraftLoopProvider:
+    def __init__(self):
+        self.tool_names_by_call: list[list[str]] = []
+        self.messages_by_call: list[list[dict]] = []
+
+    async def chat(self, messages, temperature=0.7, max_tokens=None):
+        return json.dumps({
+            "intent": "chapter_draft",
+            "confidence": 0.9,
+            "reasons": ["mock: 写章节"],
+            "suggested_workflow": "chapter_draft",
+        }, ensure_ascii=False)
+
+    async def chat_with_tools(self, messages, tools=None, temperature=0.7, max_tokens=None):
+        self.messages_by_call.append(messages)
+        names = [tool["function"]["name"] for tool in (tools or [])]
+        self.tool_names_by_call.append(names)
+        call_no = len(self.tool_names_by_call)
+
+        if call_no == 1:
+            return {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_activate_draft",
+                    "name": "activate_skill",
+                    "arguments": {"skill_name": "draft_writer"},
+                }],
+            }
+
+        if call_no == 2:
+            return {
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_outline", "name": "get_outline_structure", "arguments": {}},
+                    {"id": "call_events", "name": "list_events", "arguments": {}},
+                    {"id": "call_characters", "name": "list_characters", "arguments": {}},
+                    {"id": "call_foreshadows", "name": "list_foreshadows", "arguments": {}},
+                    {"id": "call_prev", "name": "read_file", "arguments": {"path": "正文/上一章.md"}},
+                ],
+            }
+
+        if call_no == 3:
+            return {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_write_chapter",
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "正文/第一章.md",
+                        "content": "# 第一章\n\n林玄在黑玉发热时推开宗门旧门。",
+                    },
+                }],
+            }
+
+        if call_no == 4:
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_event",
+                        "name": "create_event",
+                        "arguments": {
+                            "name": "黑玉发热",
+                            "description": "第一章草稿中黑玉第一次主动发热。",
+                            "status": "planned",
+                        },
+                    },
+                    {
+                        "id": "call_todo",
+                        "name": "manageTodos",
+                        "arguments": {
+                            "action": "add",
+                            "text": "审批后补角色状态",
+                            "priority": "medium",
+                        },
+                    },
+                ],
+            }
+
+        return {
+            "content": "",
+            "tool_calls": [{
+                "id": "call_final",
+                "name": "final_answer",
+                "arguments": {"message": "第一章草稿已进入审批，并同步了事件和待办。"},
+            }],
+        }
+
+
+class LeakyToolContentProvider:
+    async def chat(self, messages, temperature=0.7, max_tokens=None):
+        return json.dumps({
+            "intent": "outline_planning",
+            "confidence": 0.9,
+            "reasons": ["mock: 大纲规划"],
+            "suggested_workflow": None,
+        }, ensure_ascii=False)
+
+    async def chat_with_tools(self, messages, tools=None, temperature=0.7, max_tokens=None):
+        return {
+            "content": '好，10卷已创建。{"id":"v1","name":"卷一：穿越背债"}',
+            "tool_calls": [{
+                "id": "call_final",
+                "name": "final_answer",
+                "arguments": {"message": "大纲结构已创建，待审批内容请在审批面板查看。"},
+            }],
+        }
+
+
 class AgentEngineIntentTests(ProjectTestCase):
     async def test_run_agent_emits_intent_event_before_answer(self):
         # 意图识别默认禁用，启用后测试
@@ -310,6 +422,7 @@ class AgentEngineIntentTests(ProjectTestCase):
         old_value = settings.enable_proactive_questionnaire
         settings.enable_proactive_questionnaire = True
         provider = MissingFileQuestionnaireProvider()
+        session_id = "s_questionnaire"
         try:
             events = []
             async for event in run_agent(
@@ -317,6 +430,7 @@ class AgentEngineIntentTests(ProjectTestCase):
                 provider,
                 self.project_id,
                 self.project_dir,
+                session_id=session_id,
             ):
                 events.append(event)
                 if event["type"] == "questionnaire":
@@ -332,7 +446,108 @@ class AgentEngineIntentTests(ProjectTestCase):
             self.assertEqual(events[-1]["questionnaire"]["questions"][0]["id"], "chapter_goal")
         finally:
             settings.enable_proactive_questionnaire = old_value
-            clear_questionnaire(self.project_id)
+            await clear_questionnaire(self.project_id, session_id=session_id)
+
+    async def test_chapter_draft_loop_reaches_approval_sync_todo_and_summary(self):
+        (self.project_dir / "正文").mkdir(parents=True, exist_ok=True)
+        (self.project_dir / "正文" / "上一章.md").write_text(
+            "# 上一章\n\n林玄得到黑玉，但尚不知其用途。",
+            encoding="utf-8",
+        )
+        provider = ChapterDraftLoopProvider()
+
+        events = []
+        async for event in run_agent(
+            [{"role": "user", "content": "帮我写第1章，承接上一章黑玉伏笔"}],
+            provider,
+            self.project_id,
+            self.project_dir,
+        ):
+            events.append(event)
+            if event["type"] == "done":
+                break
+
+        self.assertGreaterEqual(len(provider.tool_names_by_call), 4)
+        second_call_tools = provider.tool_names_by_call[1]
+        for expected in [
+            "get_outline_structure",
+            "list_events",
+            "list_characters",
+            "list_foreshadows",
+            "read_file",
+            "write_file",
+            "manageTodos",
+        ]:
+            self.assertIn(expected, second_call_tools)
+
+        approvals = [e for e in events if e["type"] == "approval_required"]
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["pending_change"]["file_path"], "正文/第一章.md")
+        self.assertIn("林玄在黑玉发热时", approvals[0]["pending_change"]["new_content"])
+
+        tool_history = [
+            e["message"]["content"]
+            for e in events
+            if e["type"] == "history" and e.get("message", {}).get("role") == "tool"
+        ]
+        self.assertTrue(any("待审批内容（Shadow Read）" in content for content in tool_history))
+        self.assertTrue(any("第一章" in content for content in tool_history))
+
+        todo_events = [e for e in events if e["type"] == "todo"]
+        self.assertEqual(len(todo_events), 1)
+        self.assertEqual(todo_events[0]["items"][0]["text"], "审批后补角色状态")
+        self.assertEqual(events[-1]["content"], "第一章草稿已进入审批，并同步了事件和待办。")
+
+    async def test_tool_call_content_is_not_shown_as_chat_delta(self):
+        events = []
+        async for event in run_agent(
+            [{"role": "user", "content": "创建全书大纲结构"}],
+            LeakyToolContentProvider(),
+            self.project_id,
+            self.project_dir,
+        ):
+            events.append(event)
+            if event["type"] == "done":
+                break
+
+        visible_text = "\n".join(e.get("content", "") for e in events if e["type"] in {"delta", "done"})
+        self.assertIn("大纲结构已创建", visible_text)
+        self.assertNotIn("10卷已创建", visible_text)
+        self.assertNotIn('"id":"v1"', visible_text)
+
+    async def test_shadow_read_artifacts_are_removed_from_visible_content(self):
+        leaked = '''✅ 文件 "章节大纲/全书大纲.md" 的变更已排队等待用户审批。
+操作: 写入文件: 章节大纲/全书大纲.md
+
+## 待审批内容（Shadow Read）
+以下是你要写入的完整内容，用户审批后会写入文件：
+
+```markdown
+# 全书大纲
+```
+
+请继续执行其他任务，假设此变更会被批准。'''
+
+        self.assertEqual(_sanitize_user_visible_content(leaked), "")
+
+    async def test_tool_runner_preserves_write_barriers_between_read_batches(self):
+        calls: list[str] = []
+
+        async def fake_execute_tool(tool_call, project_id, session_id=""):
+            calls.append(tool_call.name)
+            return ToolResult(status=ToolResultStatus.EXECUTED, tool_name=tool_call.name, result={"ok": True})
+
+        runner = ToolRunner(self.project_id)
+        with patch("core.agent.tool_runner.execute_tool", side_effect=fake_execute_tool):
+            results = await runner.run_concurrent([
+                ToolCall(id="r1", name="read_file", arguments={"path": "a.md"}),
+                ToolCall(id="w1", name="write_file", arguments={"path": "b.md", "content": "B"}),
+                ToolCall(id="r2", name="grep", arguments={"query": "B"}),
+                ToolCall(id="w2", name="manageTodos", arguments={"action": "add", "text": "收尾"}),
+            ])
+
+        self.assertEqual([r.tool_name for r in results], ["read_file", "write_file", "grep", "manageTodos"])
+        self.assertEqual(calls, ["read_file", "write_file", "grep", "manageTodos"])
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ interface TreeNode {
   status?: string
   summary?: string
   file_path?: string
+  parent_id?: string | null
+  sort_order?: number
   day?: number
   hour?: number
   description?: string
@@ -38,6 +40,7 @@ export function OutlineViewer({ projectId }: Props) {
   const [newEventDay, setNewEventDay] = useState<number>(0)
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedNode, setSelectedNode] = useState<TreeNode | null>(null)
+  const [dragNode, setDragNode] = useState<TreeNode | null>(null)
 
   const fetchTimeline = useCallback(async () => {
     try {
@@ -59,6 +62,8 @@ export function OutlineViewer({ projectId }: Props) {
           id: ch.id, name: ch.name, type: 'chapter',
           status: ch.summary ? 'completed' : 'planned',
           file_path: ch.file_path, summary: ch.summary,
+          parent_id: volId,
+          sort_order: ch.sort_order ?? 0,
         })
       }
 
@@ -72,6 +77,7 @@ export function OutlineViewer({ projectId }: Props) {
           day: evt.day, hour: evt.hour,
           description: evt.description,
           story_line_id: evt.story_line_id,
+          parent_id: chId,
         })
       }
 
@@ -86,13 +92,14 @@ export function OutlineViewer({ projectId }: Props) {
       // Build volume nodes
       const treeNodes: TreeNode[] = volumes.map((v: any) => ({
         id: v.id, name: v.name, type: 'volume' as const,
+        sort_order: v.sort_order ?? 0,
         children: chapterMap.get(v.id) || [],
       }))
 
       // Add orphan chapters (no volume)
       const orphans = chapterMap.get('__root__')
       if (orphans?.length) {
-        treeNodes.push({ id: '__root__', name: '未分卷章节', type: 'volume', children: orphans })
+        treeNodes.push({ id: '__root__', name: '未分卷章节', type: 'volume', children: orphans, sort_order: 999999 })
       }
 
       setTree(treeNodes)
@@ -131,6 +138,73 @@ export function OutlineViewer({ projectId }: Props) {
       setShowCreateEvent(false)
       fetchTimeline()
     } catch {}
+  }
+
+  const findSiblings = useCallback((node: TreeNode): TreeNode[] => {
+    if (node.type === 'volume') return tree.filter(item => item.type === 'volume' && item.id !== '__root__')
+    if (node.type === 'chapter') {
+      const parent = tree.find(vol => vol.id === node.parent_id)
+      return (parent?.children || []).filter(item => item.type === 'chapter')
+    }
+    if (node.type === 'event') {
+      for (const vol of tree) {
+        const chapter = (vol.children || []).find(ch => ch.id === node.parent_id)
+        if (chapter) return (chapter.children || []).filter(item => item.type === 'event')
+      }
+    }
+    return []
+  }, [tree])
+
+  const persistSiblingOrder = async (nodes: TreeNode[]) => {
+    await Promise.all(nodes.map((node, index) => {
+      if (node.type === 'volume') {
+        return fetch(`/api/timeline/${projectId}/volumes/${node.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sort_order: index }),
+        })
+      }
+      if (node.type === 'chapter') {
+        return fetch(`/api/timeline/${projectId}/chapters/${node.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sort_order: index, volume_id: node.parent_id === '__root__' ? null : node.parent_id }),
+        })
+      }
+      return Promise.resolve()
+    }))
+  }
+
+  const handleDropNode = async (target: TreeNode) => {
+    if (!dragNode || dragNode.id === target.id) return
+    try {
+      if (dragNode.type === 'chapter' && target.type === 'volume' && target.id !== '__root__') {
+        await fetch(`/api/timeline/${projectId}/chapters/${dragNode.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ volume_id: target.id }),
+        })
+      } else if (dragNode.type === 'event' && target.type === 'chapter') {
+        await fetch(`/api/timeline/${projectId}/events/${dragNode.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chapter_id: target.id }),
+        })
+      } else if (dragNode.type === target.type && dragNode.parent_id === target.parent_id) {
+        const siblings = findSiblings(target)
+        const from = siblings.findIndex(item => item.id === dragNode.id)
+        const to = siblings.findIndex(item => item.id === target.id)
+        if (from >= 0 && to >= 0) {
+          const next = [...siblings]
+          const [moved] = next.splice(from, 1)
+          next.splice(to, 0, moved)
+          await persistSiblingOrder(next)
+        }
+      }
+      fetchTimeline()
+    } finally {
+      setDragNode(null)
+    }
   }
 
   // 统计数据
@@ -235,7 +309,14 @@ export function OutlineViewer({ projectId }: Props) {
               <div style={styles.empty}>暂无大纲数据</div>
             ) : (
               filteredTree.map(node => (
-                <OutlineNode key={node.id} node={node} level={0} onNodeClick={handleNodeClick} />
+                <OutlineNode
+                  key={node.id}
+                  node={node}
+                  level={0}
+                  onNodeClick={handleNodeClick}
+                  onDragStartNode={setDragNode}
+                  onDropNode={handleDropNode}
+                />
               ))
             )}
           </div>

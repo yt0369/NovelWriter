@@ -8,15 +8,18 @@ interface TreeNode {
   status?: string
   summary?: string
   file_path?: string
+  parent_id?: string | null
 }
 
 interface Props {
   node: TreeNode
   level: number
   onNodeClick?: (node: TreeNode) => void
+  onDragStartNode?: (node: TreeNode) => void
+  onDropNode?: (node: TreeNode) => void
 }
 
-export function OutlineNode({ node, level, onNodeClick }: Props) {
+export function OutlineNode({ node, level, onNodeClick, onDragStartNode, onDropNode }: Props) {
   const [expanded, setExpanded] = useState(level < 2)
   const hasChildren = node.children && node.children.length > 0
 
@@ -27,6 +30,22 @@ export function OutlineNode({ node, level, onNodeClick }: Props) {
     <div>
       <div
         style={{ ...styles.node, paddingLeft: level * 16 }}
+        draggable
+        onDragStart={e => {
+          e.stopPropagation()
+          e.dataTransfer.effectAllowed = 'move'
+          onDragStartNode?.(node)
+        }}
+        onDragOver={e => {
+          e.preventDefault()
+          e.stopPropagation()
+          e.dataTransfer.dropEffect = 'move'
+        }}
+        onDrop={e => {
+          e.preventDefault()
+          e.stopPropagation()
+          onDropNode?.(node)
+        }}
         onClick={() => {
           if (hasChildren) setExpanded(!expanded)
           onNodeClick?.(node)
@@ -48,7 +67,14 @@ export function OutlineNode({ node, level, onNodeClick }: Props) {
       {expanded && hasChildren && (
         <div>
           {node.children!.map(child => (
-            <OutlineNode key={child.id} node={child} level={level + 1} onNodeClick={onNodeClick} />
+            <OutlineNode
+              key={child.id}
+              node={child}
+              level={level + 1}
+              onNodeClick={onNodeClick}
+              onDragStartNode={onDragStartNode}
+              onDropNode={onDropNode}
+            />
           ))}
         </div>
       )}
@@ -59,7 +85,7 @@ export function OutlineNode({ node, level, onNodeClick }: Props) {
 const styles: Record<string, React.CSSProperties> = {
   node: {
     display: 'flex', alignItems: 'center', gap: 6,
-    padding: '4px 8px', cursor: 'pointer', fontSize: 13,
+    padding: '4px 8px', cursor: 'grab', fontSize: 13,
     color: '#e5e7eb', borderRadius: 4,
   },
   expandIcon: { width: 12, fontSize: 10, color: '#6b7280', textAlign: 'center' },

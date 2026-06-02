@@ -134,7 +134,7 @@ async def create_project(req: ProjectCreate):
     if req.preset_id and req.preset_id in GENRE_PRESETS:
         preset = GENRE_PRESETS[req.preset_id]
         for skill_name in preset["skills"]:
-            activate_skill(skill_name)
+            activate_skill(skill_name, scope=project_id)
             await _upsert_project_skill_setting(project_id, skill_name, "preset")
         rules_path = project_dir / "规范" / "写作规范.md"
         rules_path.parent.mkdir(parents=True, exist_ok=True)

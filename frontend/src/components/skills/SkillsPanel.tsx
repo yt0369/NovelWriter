@@ -23,6 +23,7 @@ interface Props {
 export function SkillsPanel({ visible, projectId }: Props) {
   const [skills, setSkills] = useState<Skill[]>([])
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
   const { setActiveFile, setActiveContent, setIsDirty } = useEditorStore()
   const { activateSkill, deactivateSkill, isSkillActive, getSkillState } = useSkillTriggerStore()
 
@@ -37,23 +38,29 @@ export function SkillsPanel({ visible, projectId }: Props) {
         setActiveContent(data.content)
         setIsDirty(false)
       }
-    } catch {}
+    } catch {
+      setError('技能文件加载失败')
+    }
   }
 
   const fetchSkills = async () => {
     setLoading(true)
     try {
-      const res = await fetch('/api/skills/')
+      const res = await fetch(`/api/skills/?project_id=${encodeURIComponent(projectId)}`)
+      if (!res.ok) throw new Error('技能列表加载失败')
       const data = await res.json()
       setSkills(data)
-    } catch {} finally {
+      setError('')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '技能列表加载失败')
+    } finally {
       setLoading(false)
     }
   }
 
   useEffect(() => {
     if (visible) fetchSkills()
-  }, [visible])
+  }, [visible, projectId])
 
   const toggleSkill = async (skill: Skill) => {
     const newActive = !skill.active
@@ -64,13 +71,16 @@ export function SkillsPanel({ visible, projectId }: Props) {
       deactivateSkill(skill.name)
     }
     try {
-      await fetch(`/api/skills/${projectId}/${newActive ? 'activate' : 'deactivate'}`, {
+      const res = await fetch(`/api/skills/${projectId}/${newActive ? 'activate' : 'deactivate'}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ skill_name: skill.name }),
       })
+      if (!res.ok) throw new Error(newActive ? '技能激活失败' : '技能关闭失败')
+      setError('')
     } catch {
       setSkills(prev => prev.map(s => s.name === skill.name ? { ...s, active: !newActive } : s))
+      setError(newActive ? '技能激活失败' : '技能关闭失败')
     }
   }
 
@@ -97,6 +107,7 @@ export function SkillsPanel({ visible, projectId }: Props) {
       <div style={styles.hint}>
         技能会在对话中自动激活，也可手动切换
       </div>
+      {error && <div style={styles.error}>{error}</div>}
 
       <div style={styles.list}>
         {Object.entries(groupSkills(skills)).map(([category, items]) => (
@@ -183,6 +194,9 @@ const styles: Record<string, React.CSSProperties> = {
   },
   hint: {
     fontSize: 11, color: '#6b7280', padding: '8px 16px', lineHeight: 1.4,
+  },
+  error: {
+    fontSize: 12, color: '#fca5a5', padding: '0 16px 8px',
   },
   list: { flex: 1, overflow: 'auto', padding: '0 12px 12px' },
   categoryTitle: { color: '#14b8a6', fontSize: 12, fontWeight: 700, margin: '10px 2px 6px' },

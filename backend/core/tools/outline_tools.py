@@ -1,7 +1,6 @@
-import uuid
-
-from models.tools import ToolDefinition, ToolFunction, ToolCall, ToolResult, ToolResultStatus, PendingChange
+from models.tools import ToolDefinition, ToolFunction, ToolCall, ToolResult, ToolResultStatus
 from config import settings
+from core.pending_changes import create_pending_change
 
 
 def get_outline_tool_definitions() -> list[ToolDefinition]:
@@ -54,17 +53,18 @@ async def execute_outline_tool(tool_call: ToolCall, project_id: str) -> ToolResu
             if file_path.exists():
                 original = file_path.read_text(encoding="utf-8")
 
+            pending_change = await create_pending_change(
+                project_id=project_id,
+                tool_name=name,
+                file_path=rel_path,
+                original_content=original,
+                new_content=content,
+                description=f"创建大纲: {rel_path}",
+            )
             return ToolResult(
                 status=ToolResultStatus.APPROVAL_REQUIRED,
                 tool_name=name,
-                pending_change=PendingChange(
-                    id=str(uuid.uuid4())[:8],
-                    tool_name=name,
-                    file_path=rel_path,
-                    original_content=original,
-                    new_content=content,
-                    description=f"创建大纲: {rel_path}",
-                ),
+                pending_change=pending_change,
             )
 
         elif name == "update_outline_section":
@@ -81,17 +81,18 @@ async def execute_outline_tool(tool_call: ToolCall, project_id: str) -> ToolResu
             else:
                 return ToolResult(status=ToolResultStatus.ERROR, tool_name=name, error=f"大纲文件不存在: {rel_path}")
 
+            pending_change = await create_pending_change(
+                project_id=project_id,
+                tool_name=name,
+                file_path=rel_path,
+                original_content=original,
+                new_content=new_content,
+                description=f"更新大纲: {rel_path}",
+            )
             return ToolResult(
                 status=ToolResultStatus.APPROVAL_REQUIRED,
                 tool_name=name,
-                pending_change=PendingChange(
-                    id=str(uuid.uuid4())[:8],
-                    tool_name=name,
-                    file_path=rel_path,
-                    original_content=original,
-                    new_content=new_content,
-                    description=f"更新大纲: {rel_path}",
-                ),
+                pending_change=pending_change,
             )
 
         elif name == "get_outline_structure":

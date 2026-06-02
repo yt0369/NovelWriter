@@ -10,6 +10,16 @@ export interface PendingChange {
   diff: string
   original_content: string
   new_content: string
+  metadata?: {
+    edits?: Array<{
+      id: string
+      old_text?: string
+      new_text?: string
+      status?: string
+      replace_all?: boolean
+    }>
+    patch_report?: Array<Record<string, unknown>>
+  }
   status?: string
   source?: string
   created_at?: number

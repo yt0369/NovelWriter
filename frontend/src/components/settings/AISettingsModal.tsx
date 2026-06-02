@@ -37,6 +37,11 @@ interface FullAISettings {
   context_token_limit: number
   safety_setting: string
   language: string
+  temperature: number
+  top_p: number
+  top_k: number
+  thinking_enabled: boolean
+  thinking_budget_tokens?: number
   auto_extraction: AutoExtraction
   model_routes: Record<string, ModelRoute>
   has_api_key: boolean
@@ -87,6 +92,21 @@ const RECOMMENDED_CONFIGS: Record<string, Partial<OpenAIBackend>> = {
 
 interface Props { onClose: () => void }
 
+function optionalInt(value: string) {
+  const parsed = parseInt(value, 10)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function intWithFallback(value: string, fallback: number) {
+  const parsed = parseInt(value, 10)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function numberWithFallback(value: string, fallback: number) {
+  const parsed = parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
 export function AISettingsModal({ onClose }: Props) {
   const [settings, setSettings] = useState<FullAISettings | null>(null)
   const [showKey, setShowKey] = useState(false)
@@ -96,6 +116,7 @@ export function AISettingsModal({ onClose }: Props) {
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<Record<string, unknown> | null>(null)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     fetch('/api/settings/ai')
@@ -105,7 +126,7 @@ export function AISettingsModal({ onClose }: Props) {
           data.backends = [
             { id: 'blazeapi', name: 'BlazeAPI', base_url: 'https://blazeai.boxu.dev/api/', api_key: '', model_name: 'qwen3.6-plus', thinking_enabled: false },
             { id: 'blaze-thinking', name: 'Blaze Thinking', base_url: 'https://blazeai.boxu.dev/api/', api_key: '', model_name: 'qwen3.6-max-preview-thinking', thinking_enabled: true },
-            { id: 'skyclaw', name: 'SkyClaw', base_url: 'https://api.apifree.ai/agent/v1', api_key: '', model_name: 'skywork-ai/skyclaw-v1', thinking_enabled: true },
+            { id: 'skyclaw', name: 'SkyClaw', base_url: 'https://api.apifree.ai/v1', api_key: '', model_name: 'skywork-ai/skyclaw-v1', thinking_enabled: true },
             { id: 'deepseek', name: 'DeepSeek', base_url: 'https://api.deepseek.com', api_key: '', model_name: 'deepseek-chat', thinking_enabled: false },
             { id: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', api_key: '', model_name: 'gpt-4o', thinking_enabled: false },
           ]
@@ -114,8 +135,9 @@ export function AISettingsModal({ onClose }: Props) {
         if (!data.auto_extraction) data.auto_extraction = { conversation: true, document: true, chapter_analysis: true }
         if (!data.model_routes) data.model_routes = {}
         setSettings(data)
+        setError('')
       })
-      .catch(() => {})
+      .catch(() => setError('AI 配置加载失败，请确认后端服务正在运行。'))
   }, [])
 
   const activeBackend = settings?.backends?.find(b => b.id === settings.active_backend_id)
@@ -166,7 +188,7 @@ export function AISettingsModal({ onClose }: Props) {
       const res = await fetch('/api/settings/models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_base_url: activeBackend.base_url, api_key: key }),
+        body: JSON.stringify({ backend_id: activeBackend.id, api_base_url: activeBackend.base_url, api_key: key }),
       })
       const data = await res.json()
       if (data.models && Array.isArray(data.models)) {
@@ -179,12 +201,20 @@ export function AISettingsModal({ onClose }: Props) {
   const handleSave = async () => {
     if (!settings) return
     setSaving(true)
+    setError('')
     try {
       const active = settings.backends.find(b => b.id === settings.active_backend_id)
       const finalSettings = { ...settings }
       if (active) {
         finalSettings.api_base_url = active.base_url
         finalSettings.model = active.model_name
+        finalSettings.max_output_tokens = active.max_output_tokens
+        finalSettings.context_token_limit = active.context_token_limit || finalSettings.context_token_limit
+        finalSettings.temperature = active.temperature ?? finalSettings.temperature
+        finalSettings.top_p = active.top_p ?? finalSettings.top_p
+        finalSettings.top_k = active.top_k ?? finalSettings.top_k
+        finalSettings.thinking_enabled = active.thinking_enabled
+        finalSettings.thinking_budget_tokens = active.thinking_budget_tokens
         // 只在用户输入了新 key 时才发送（*** 是后端返回的掩码，不发送）
         if (active.api_key && active.api_key !== '***') {
           finalSettings.api_key = active.api_key
@@ -192,9 +222,12 @@ export function AISettingsModal({ onClose }: Props) {
           finalSettings.api_key = ''  // 空字符串表示不更新
         }
       }
-      await fetch('/api/settings/ai', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(finalSettings) })
+      const res = await fetch('/api/settings/ai', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(finalSettings) })
+      if (!res.ok) throw new Error('保存失败')
       onClose()
-    } catch {}
+    } catch {
+      setError('保存失败，请检查配置内容或后端日志。')
+    }
     setSaving(false)
   }
 
@@ -206,14 +239,29 @@ export function AISettingsModal({ onClose }: Props) {
       const res = await fetch('/api/settings/ai/test-connection', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: activeBackend.api_key === '***' ? '' : activeBackend.api_key, api_base_url: activeBackend.base_url, model: activeBackend.model_name }),
+        body: JSON.stringify({ backend_id: activeBackend.id, api_key: activeBackend.api_key === '***' ? '' : activeBackend.api_key, api_base_url: activeBackend.base_url, model: activeBackend.model_name }),
       })
       setTestResult(await res.json())
     } catch { setTestResult({ ok: false, error: '请求失败' }) }
     setTesting(false)
   }
 
-  if (!settings || !activeBackend) return null
+  if (!settings || !activeBackend) {
+    if (!error) return null
+    return (
+      <div style={s.overlay}>
+        <div style={s.modal}>
+          <div style={s.header}>
+            <span style={s.title}>⚡ AI 模型配置</span>
+            <button style={s.closeBtn} onClick={onClose}>✕</button>
+          </div>
+          <div style={s.body}>
+            <div style={s.testError}>{error}</div>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div style={s.overlay}>
@@ -311,14 +359,14 @@ export function AISettingsModal({ onClose }: Props) {
           {/* Max Output Tokens */}
           <div style={s.section}>
             <label style={s.label}>最大输出 Tokens</label>
-            <input style={s.input} type="number" value={activeBackend.max_output_tokens || ''} onChange={e => updateActiveBackend({ max_output_tokens: parseInt(e.target.value) || undefined })} placeholder="8192" />
+            <input style={s.input} type="number" value={activeBackend.max_output_tokens || ''} onChange={e => updateActiveBackend({ max_output_tokens: optionalInt(e.target.value) })} placeholder="8192" />
             <span style={s.hint}>限制单次回复的最大 token 数量</span>
           </div>
 
           {/* Context Token Limit */}
           <div style={s.section}>
             <label style={s.label}>上下文 Token 限制</label>
-            <input style={s.input} type="number" min={8192} step={1024} value={activeBackend.context_token_limit ?? 256000} onChange={e => updateActiveBackend({ context_token_limit: parseInt(e.target.value) || 256000 })} />
+            <input style={s.input} type="number" min={8192} step={1024} value={activeBackend.context_token_limit ?? 256000} onChange={e => updateActiveBackend({ context_token_limit: intWithFallback(e.target.value, 256000) })} />
             <span style={s.hint}>用于上下文用量统计和预警，默认 256k</span>
           </div>
 
@@ -326,17 +374,17 @@ export function AISettingsModal({ onClose }: Props) {
           <div style={s.row}>
             <div style={{ ...s.section, flex: 1, marginBottom: 0 }}>
               <label style={s.label}>Temperature</label>
-              <input style={s.input} type="number" min={0} max={2} step={0.1} value={activeBackend.temperature ?? 0.7} onChange={e => updateActiveBackend({ temperature: parseFloat(e.target.value) || 0.7 })} />
+              <input style={s.input} type="number" min={0} max={2} step={0.1} value={activeBackend.temperature ?? 0.7} onChange={e => updateActiveBackend({ temperature: numberWithFallback(e.target.value, 0.7) })} />
               <span style={s.hint}>随机性：0=确定，1=创意</span>
             </div>
             <div style={{ ...s.section, flex: 1, marginBottom: 0 }}>
               <label style={s.label}>Top P</label>
-              <input style={s.input} type="number" min={0} max={1} step={0.05} value={activeBackend.top_p ?? 0.95} onChange={e => updateActiveBackend({ top_p: parseFloat(e.target.value) || 0.95 })} />
+              <input style={s.input} type="number" min={0} max={1} step={0.05} value={activeBackend.top_p ?? 0.95} onChange={e => updateActiveBackend({ top_p: numberWithFallback(e.target.value, 0.95) })} />
               <span style={s.hint}>核采样：控制多样性</span>
             </div>
             <div style={{ ...s.section, flex: 1, marginBottom: 0 }}>
               <label style={s.label}>Top K</label>
-              <input style={s.input} type="number" min={1} max={100} step={1} value={activeBackend.top_k ?? 20} onChange={e => updateActiveBackend({ top_k: parseInt(e.target.value) || 20 })} />
+              <input style={s.input} type="number" min={1} max={100} step={1} value={activeBackend.top_k ?? 20} onChange={e => updateActiveBackend({ top_k: intWithFallback(e.target.value, 20) })} />
               <span style={s.hint}>Top-K 采样（SkyClaw）</span>
             </div>
           </div>
@@ -353,7 +401,7 @@ export function AISettingsModal({ onClose }: Props) {
             {activeBackend.thinking_enabled && (
               <div style={{ marginTop: 8 }}>
                 <label style={s.label}>思考预算 Tokens</label>
-                <input style={s.input} type="number" value={activeBackend.thinking_budget_tokens || ''} onChange={e => updateActiveBackend({ thinking_budget_tokens: parseInt(e.target.value) || undefined })} placeholder="10000" />
+                <input style={s.input} type="number" value={activeBackend.thinking_budget_tokens || ''} onChange={e => updateActiveBackend({ thinking_budget_tokens: optionalInt(e.target.value) })} placeholder="10000" />
               </div>
             )}
           </div>
@@ -431,6 +479,7 @@ export function AISettingsModal({ onClose }: Props) {
               {testResult.ok ? `✓ 连接成功 (${testResult.model})` : `✗ ${testResult.error || '连接失败'}`}
             </div>
           )}
+          {error && <div style={s.testError}>{error}</div>}
         </div>
 
         <div style={s.footer}>

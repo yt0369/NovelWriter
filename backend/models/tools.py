@@ -41,6 +41,7 @@ class PendingChange(BaseModel):
     original_content: str
     new_content: str
     description: str
+    metadata: dict[str, Any] | None = None
 
 
 class ToolResult(BaseModel):

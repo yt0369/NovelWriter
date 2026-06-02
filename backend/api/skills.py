@@ -9,6 +9,7 @@ from core.presets.context import preset_context_enabled, project_preset_id
 from core.skills.registry import (
     get_all_skills, get_active_skills, activate_skill, deactivate_skill,
 )
+from core.skills.project_state import get_project_active_skill_names
 from core.skills.assets import list_skill_assets, ASSETS_DIR
 import time
 import uuid
@@ -22,10 +23,13 @@ class SkillAction(BaseModel):
 
 
 @router.get("/")
-async def list_skills():
+async def list_skills(project_id: str = ""):
     """列出所有技能及激活状态。"""
     skills = get_all_skills()
-    active_names = {a.skill.name for a in get_active_skills()}
+    if project_id:
+        active_names = await get_project_active_skill_names(project_id)
+    else:
+        active_names = {a.skill.name for a in get_active_skills()}
     return [
         {
             "name": s.name,
@@ -95,7 +99,7 @@ async def toggle_skill(body: SkillAction):
 
 @router.post("/{project_id}/activate")
 async def activate_project_skill(project_id: str, body: SkillAction):
-    skill = activate_skill(body.skill_name)
+    skill = activate_skill(body.skill_name, scope=project_id)
     if not skill:
         return {"error": f"技能不存在: {body.skill_name}"}
     await _set_project_skill(project_id, body.skill_name, True, "manual")
@@ -104,7 +108,7 @@ async def activate_project_skill(project_id: str, body: SkillAction):
 
 @router.post("/{project_id}/deactivate")
 async def deactivate_project_skill(project_id: str, body: SkillAction):
-    deactivate_skill(body.skill_name)
+    deactivate_skill(body.skill_name, scope=project_id)
     await _set_project_skill(project_id, body.skill_name, False, "manual")
     return {"status": "deactivated", "skill": body.skill_name}
 

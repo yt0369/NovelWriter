@@ -39,10 +39,56 @@ async def get_db(project_id: str | None = None) -> aiosqlite.Connection:
         schema_path = Path(__file__).parent / "schema.sql"
         schema = schema_path.read_text(encoding="utf-8")
         await db.executescript(schema)
+        await _run_lightweight_migrations(db)
         await db.commit()
         _initialized_dbs.add(db_key)
 
     return db
+
+
+async def _run_lightweight_migrations(db: aiosqlite.Connection):
+    """Apply additive migrations for existing project databases."""
+    columns = await db.execute_fetchall("PRAGMA table_info(pending_changes)")
+    names = {row["name"] for row in columns}
+    if "metadata" not in names:
+        await db.execute("ALTER TABLE pending_changes ADD COLUMN metadata TEXT")
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS questionnaires (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            questions TEXT NOT NULL,
+            answers TEXT DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_q_project_session_status ON questionnaires(project_id, session_id, status, updated_at)"
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS external_skills (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            description TEXT NOT NULL,
+            author TEXT,
+            entry TEXT NOT NULL,
+            permissions TEXT NOT NULL DEFAULT '[]',
+            keywords TEXT NOT NULL DEFAULT '[]',
+            min_app_version TEXT,
+            source_type TEXT NOT NULL,
+            source_url TEXT,
+            install_path TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_external_skills_enabled ON external_skills(enabled, updated_at)"
+    )
 
 
 @asynccontextmanager
@@ -59,5 +105,6 @@ async def init_db(project_id: str | None = None):
     schema_path = Path(__file__).parent / "schema.sql"
     schema = schema_path.read_text(encoding="utf-8")
     await db.executescript(schema)
+    await _run_lightweight_migrations(db)
     await db.commit()
     await db.close()

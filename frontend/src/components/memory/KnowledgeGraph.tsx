@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { MemorySearch } from './MemorySearch'
-import { NodeDetail } from './NodeDetail'
+import { KnowledgeNodeEditor } from './KnowledgeNodeEditor'
 import { RelationshipGraph } from './RelationshipGraph'
 import { KnowledgeTreeView } from './KnowledgeTreeView'
 import { KNOWLEDGE_UPDATED_EVENT, WORKSPACE_REFRESH_EVENT, WorkspaceRefreshDetail } from '../../utils/workspaceEvents'
@@ -162,7 +162,7 @@ export function KnowledgeGraph({ projectId, visible }: Props) {
       )}
 
       {selectedNodeId && (
-        <NodeDetail
+        <KnowledgeNodeEditor
           projectId={projectId}
           nodeId={selectedNodeId}
           onClose={() => setSelectedNodeId(null)}

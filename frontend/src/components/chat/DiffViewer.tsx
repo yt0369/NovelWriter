@@ -3,8 +3,20 @@ import { useState, useMemo } from 'react'
 interface Props {
   diff: string
   filePath: string
+  edits?: PatchEdit[]
   onApprove?: () => void
   onReject?: () => void
+  onEditStatusChange?: (editId: string, status: 'accepted' | 'rejected' | 'pending') => void
+  actionBusy?: boolean
+  actionMessage?: string
+}
+
+interface PatchEdit {
+  id: string
+  old_text?: string
+  new_text?: string
+  status?: string
+  replace_all?: boolean
 }
 
 type LineType = 'added' | 'removed' | 'unchanged' | 'header' | 'meta'
@@ -108,7 +120,16 @@ function lineStyle(type: LineType): React.CSSProperties {
   }
 }
 
-export function DiffViewer({ diff, filePath, onApprove, onReject }: Props) {
+export function DiffViewer({
+  diff,
+  filePath,
+  edits = [],
+  onApprove,
+  onReject,
+  onEditStatusChange,
+  actionBusy = false,
+  actionMessage = '',
+}: Props) {
   const [viewMode, setViewMode] = useState<'unified' | 'sideBySide'>('unified')
 
   const diffLines = useMemo(() => parseUnifiedDiff(diff), [diff])
@@ -119,9 +140,11 @@ export function DiffViewer({ diff, filePath, onApprove, onReject }: Props) {
       <div style={styles.container}>
         <div style={styles.header}>
           <span style={styles.filePath}>{filePath}</span>
-          <div style={styles.headerRight}>
-            {onReject && <button style={styles.rejectBtn} onClick={onReject}>忽略</button>}
-            {onApprove && <button style={styles.approveBtn} onClick={onApprove}>确认</button>}
+        <div style={styles.headerRight}>
+          {edits.length > 0 && <span style={styles.editCount}>{edits.length} edits</span>}
+          {actionMessage && <span style={styles.actionMessage}>{actionMessage}</span>}
+          {onReject && <button style={styles.rejectBtn} onClick={onReject} disabled={actionBusy}>忽略</button>}
+            {onApprove && <button style={styles.approveBtn} onClick={onApprove} disabled={actionBusy}>{actionBusy ? '处理中...' : '确认'}</button>}
           </div>
         </div>
         <div style={{ color: '#888', fontSize: 13, padding: 16, textAlign: 'center' }}>
@@ -204,18 +227,60 @@ export function DiffViewer({ diff, filePath, onApprove, onReject }: Props) {
               并排对比
             </button>
           </div>
+          {actionMessage && <span style={styles.actionMessage}>{actionMessage}</span>}
           {onReject && (
-            <button style={styles.rejectBtn} onClick={onReject}>
+            <button style={styles.rejectBtn} onClick={onReject} disabled={actionBusy}>
               {hasChanges ? '拒绝全部' : '忽略'}
             </button>
           )}
           {onApprove && (
-            <button style={styles.approveBtn} onClick={onApprove}>
-              {hasChanges ? '批准全部' : '确认'}
+            <button style={styles.approveBtn} onClick={onApprove} disabled={actionBusy}>
+              {actionBusy ? '处理中...' : hasChanges ? '批准全部' : '确认'}
             </button>
           )}
         </div>
       </div>
+      {edits.length > 0 && (
+        <div style={styles.editPanel}>
+          {edits.map(edit => (
+            <div key={edit.id} style={styles.editItem}>
+              <div style={styles.editMain}>
+                <span style={styles.editId}>{edit.id}</span>
+                <span style={{
+                  ...styles.editStatus,
+                  color: edit.status === 'rejected' ? '#fca5a5' : edit.status === 'accepted' ? '#86efac' : '#fbbf24',
+                }}>
+                  {edit.status === 'rejected' ? '已拒绝' : edit.status === 'accepted' ? '已接受' : '待定'}
+                </span>
+                {edit.replace_all && <span style={styles.editFlag}>全部匹配</span>}
+              </div>
+              <div style={styles.editPreview}>
+                <span style={styles.editOld}>{(edit.old_text || '').slice(0, 80) || '（空）'}</span>
+                <span style={styles.editArrow}>→</span>
+                <span style={styles.editNew}>{(edit.new_text || '').slice(0, 80) || '（空）'}</span>
+              </div>
+              {onEditStatusChange && (
+                <div style={styles.editActions}>
+                  <button
+                    style={styles.editAcceptBtn}
+                    onClick={() => onEditStatusChange(edit.id, 'accepted')}
+                    disabled={actionBusy || edit.status === 'accepted'}
+                  >
+                    接受此 edit
+                  </button>
+                  <button
+                    style={styles.editRejectBtn}
+                    onClick={() => onEditStatusChange(edit.id, 'rejected')}
+                    disabled={actionBusy || edit.status === 'rejected'}
+                  >
+                    拒绝此 edit
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
       {viewMode === 'unified' ? renderUnified() : renderSideBySide()}
     </div>
   )
@@ -244,6 +309,15 @@ const styles: Record<string, React.CSSProperties> = {
   filePath: {
     color: '#a78bfa',
     fontWeight: 600,
+  },
+  editCount: {
+    color: '#9ca3af',
+    fontSize: 11,
+  },
+  actionMessage: {
+    color: '#fbbf24',
+    fontSize: 12,
+    whiteSpace: 'nowrap',
   },
   headerRight: {
     display: 'flex',
@@ -293,6 +367,39 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 11,
     cursor: 'pointer',
     fontWeight: 600,
+  },
+  editPanel: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    padding: 8,
+    background: '#171729',
+    borderBottom: '1px solid #3a3a5e',
+    maxHeight: 180,
+    overflow: 'auto',
+  },
+  editItem: {
+    border: '1px solid #2a2a3e',
+    borderRadius: 6,
+    padding: 8,
+    background: '#12121f',
+  },
+  editMain: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 },
+  editId: { color: '#bfdbfe', fontWeight: 700, fontSize: 11 },
+  editStatus: { fontSize: 11 },
+  editFlag: { color: '#9ca3af', fontSize: 10, border: '1px solid #374151', borderRadius: 4, padding: '1px 5px' },
+  editPreview: { display: 'flex', alignItems: 'center', gap: 6, color: '#9ca3af', minWidth: 0 },
+  editOld: { color: '#fca5a5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  editArrow: { color: '#6b7280', flexShrink: 0 },
+  editNew: { color: '#86efac', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  editActions: { display: 'flex', gap: 6, marginTop: 6 },
+  editAcceptBtn: {
+    background: '#143326', border: '1px solid #166534', color: '#bbf7d0',
+    borderRadius: 4, padding: '3px 8px', fontSize: 11, cursor: 'pointer',
+  },
+  editRejectBtn: {
+    background: '#3b1d24', border: '1px solid #7f1d1d', color: '#fecaca',
+    borderRadius: 4, padding: '3px 8px', fontSize: 11, cursor: 'pointer',
   },
   diffBody: {
     flex: 1,

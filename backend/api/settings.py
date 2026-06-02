@@ -20,6 +20,7 @@ router = APIRouter()
 
 
 LAST_CONNECTION_CHECK: dict = {}
+MASKED_API_KEY = "***"
 
 
 # ─── 数据模型 ──────────────────────────────────────────────
@@ -87,6 +88,7 @@ class FullAISettings(BaseModel):
 
 
 class TestConnectionRequest(BaseModel):
+    backend_id: str = ""
     api_key: str = ""
     api_base_url: str = ""
     model: str = ""
@@ -112,6 +114,7 @@ DEFAULT_BACKENDS = [
         name="SkyClaw",
         base_url="https://api.apifree.ai/v1",
         model_name="skywork-ai/skyclaw-v1",
+        thinking_enabled=True,
     ),
     OpenAIBackend(
         id="deepseek",
@@ -132,7 +135,8 @@ DEFAULT_BACKENDS = [
 
 @router.get("/ai", response_model=FullAISettings)
 async def get_ai_settings():
-    backends = load_backends()
+    raw_backends = load_backends()
+    backends = mask_backend_api_keys(raw_backends)
     active_id = settings.active_backend_id or (backends[0].id if backends else "")
     active = next((b for b in backends if b.id == active_id), backends[0] if backends else OpenAIBackend())
 
@@ -165,38 +169,49 @@ async def get_ai_settings():
 
 @router.put("/ai")
 async def update_ai_settings(body: FullAISettings):
+    raw_backends = merge_backend_api_keys(body.backends) if body.backends else []
+
     # 更新 backends
-    if body.backends:
-        save_backends(body.backends)
+    if raw_backends:
+        save_backends(raw_backends)
 
     # 更新活跃 backend
     active_id = body.active_backend_id
     if active_id:
         settings.active_backend_id = active_id
-        active = next((b for b in body.backends if b.id == active_id), None)
+        active = next((b for b in raw_backends if b.id == active_id), None)
         if active:
-            if active.api_key and active.api_key != "***":
-                settings.api_key = active.api_key
+            settings.api_key = active.api_key or ""
             if active.base_url:
                 settings.api_base_url = normalize_api_base_url(active.base_url)
             if active.model_name:
                 settings.model = active.model_name.strip()
+            settings.max_output_tokens = active.max_output_tokens if active.max_output_tokens is not None else body.max_output_tokens
+            settings.context_token_limit = active.context_token_limit or body.context_token_limit
+            settings.temperature = active.temperature
+            settings.top_p = active.top_p
+            settings.top_k = active.top_k
+            settings.thinking_enabled = active.thinking_enabled
+            settings.thinking_budget_tokens = active.thinking_budget_tokens
 
-    # 更新全局设置
-    if body.api_key and body.api_key != "***":
+    # 兼容旧客户端：没有 provider 列表时仍允许使用顶层配置。
+    if not raw_backends and body.api_key and body.api_key != MASKED_API_KEY:
         settings.api_key = body.api_key
-    if body.api_base_url:
+    if not raw_backends and body.api_base_url:
         settings.api_base_url = normalize_api_base_url(body.api_base_url)
-    if body.model:
+    if not raw_backends and body.model:
         settings.model = body.model.strip()
+    if not raw_backends:
+        settings.max_output_tokens = body.max_output_tokens
+        settings.context_token_limit = body.context_token_limit
+        settings.temperature = body.temperature
+        settings.top_p = body.top_p
+        settings.top_k = body.top_k
+        settings.thinking_enabled = body.thinking_enabled
+        settings.thinking_budget_tokens = body.thinking_budget_tokens
 
     settings.safety_setting = body.safety_setting
     settings.language = body.language
-    settings.temperature = body.temperature
-    settings.top_p = body.top_p
-    settings.top_k = body.top_k
-    settings.thinking_enabled = body.thinking_enabled
-    settings.thinking_budget_tokens = body.thinking_budget_tokens
     settings.auto_extract_conversation = body.auto_extraction.conversation
     settings.auto_extract_document = body.auto_extraction.document
     settings.auto_extract_chapter = body.auto_extraction.chapter_analysis
@@ -222,6 +237,8 @@ def save_settings():
         "active_backend_id": settings.active_backend_id,
         "safety_setting": settings.safety_setting,
         "language": settings.language,
+        "max_output_tokens": settings.max_output_tokens,
+        "context_token_limit": settings.context_token_limit,
         "temperature": settings.temperature,
         "top_p": settings.top_p,
         "top_k": settings.top_k,
@@ -252,6 +269,10 @@ def load_settings():
                 settings.safety_setting = data["safety_setting"]
             if data.get("language"):
                 settings.language = data["language"]
+            if "max_output_tokens" in data:
+                settings.max_output_tokens = data["max_output_tokens"]
+            if "context_token_limit" in data:
+                settings.context_token_limit = data["context_token_limit"]
             if "temperature" in data:
                 settings.temperature = data["temperature"]
             if "top_p" in data:
@@ -290,6 +311,38 @@ def load_backends() -> list[OpenAIBackend]:
     return DEFAULT_BACKENDS
 
 
+def mask_backend_api_keys(backends: list[OpenAIBackend]) -> list[OpenAIBackend]:
+    masked: list[OpenAIBackend] = []
+    for backend in backends:
+        data = backend.model_dump()
+        if data.get("api_key"):
+            data["api_key"] = MASKED_API_KEY
+        masked.append(OpenAIBackend(**data))
+    return masked
+
+
+def merge_backend_api_keys(incoming: list[OpenAIBackend]) -> list[OpenAIBackend]:
+    existing = {backend.id: backend for backend in load_backends()}
+    merged: list[OpenAIBackend] = []
+    for backend in incoming:
+        data = backend.model_dump()
+        old_key = existing.get(backend.id).api_key if existing.get(backend.id) else ""
+        if backend.api_key == MASKED_API_KEY or (backend.api_key == "" and old_key):
+            data["api_key"] = old_key
+        merged.append(OpenAIBackend(**data))
+    return merged
+
+
+def resolve_request_api_key(api_key: str, backend_id: str = "") -> str:
+    if api_key and api_key != MASKED_API_KEY:
+        return api_key
+    if backend_id:
+        backend = next((b for b in load_backends() if b.id == backend_id), None)
+        if backend and backend.api_key and backend.api_key != MASKED_API_KEY:
+            return backend.api_key
+    return settings.api_key
+
+
 def save_backends(backends: list[OpenAIBackend]):
     """保存 provider 列表。"""
     bf = get_backends_file()
@@ -318,6 +371,7 @@ async def get_models():
 
 
 class FetchModelsRequest(BaseModel):
+    backend_id: str = ""
     api_base_url: str = ""
     api_key: str = ""
 
@@ -326,7 +380,7 @@ class FetchModelsRequest(BaseModel):
 async def fetch_models(body: FetchModelsRequest):
     """获取指定 Provider 的模型列表。"""
     api_base_url = normalize_api_base_url(body.api_base_url or settings.api_base_url)
-    api_key = body.api_key if body.api_key else settings.api_key
+    api_key = resolve_request_api_key(body.api_key, body.backend_id)
 
     if not api_base_url or not api_key:
         return {"models": []}
@@ -347,7 +401,7 @@ async def fetch_models(body: FetchModelsRequest):
 @router.post("/ai/test-connection")
 async def test_ai_connection(body: TestConnectionRequest):
     api_base_url = normalize_api_base_url(body.api_base_url or settings.api_base_url)
-    api_key = body.api_key if body.api_key and body.api_key != "***" else settings.api_key
+    api_key = resolve_request_api_key(body.api_key, body.backend_id)
     model = (body.model or settings.model).strip()
     provider_hint = provider_hint_for(api_base_url)
 

@@ -13,8 +13,10 @@ import { usePlanStore } from '../../stores/planStore'
 import { useTodoStore } from '../../stores/todoStore'
 import { ui } from '../../styles/ui'
 import { AISettingsModal } from '../settings/AISettingsModal'
-import { emitFileUpdated, emitKnowledgeUpdated, emitPendingUpdated, WORKSPACE_REFRESH_EVENT } from '../../utils/workspaceEvents'
+import { emitFileUpdated, emitKnowledgeUpdated, emitPendingUpdated } from '../../utils/workspaceEvents'
 import { useEditorStore } from '../../stores/editorStore'
+import { useAgentQuestionnaire } from './useAgentQuestionnaire'
+import { usePendingChanges } from './usePendingChanges'
 
 interface TodoItem {
   id: string
@@ -69,6 +71,15 @@ function normalizeSavedMessage(raw: Record<string, unknown>): ChatMessage {
   }
 }
 
+async function readResponseError(res: Response, fallback: string) {
+  try {
+    const data = await res.json()
+    return data.detail || data.error || fallback
+  } catch {
+    return fallback
+  }
+}
+
 export function AgentChat({ projectId }: Props) {
   const {
     messages,
@@ -92,14 +103,19 @@ export function AgentChat({ projectId }: Props) {
   const { activeFilePath } = useEditorStore()
   const [input, setInput] = useState('')
   const [toolCalls, setToolCalls] = useState<ToolCallInfo[]>([])
-  const [pendingChanges, setPendingChanges] = useState<PendingChange[]>([])
-  const pendingChangesRef = useRef<PendingChange[]>([])
-  useEffect(() => { pendingChangesRef.current = pendingChanges }, [pendingChanges])
-  const [questionnaire, setQuestionnaire] = useState<any>(null)
   const [todoItems, setTodoItems] = useState<TodoItem[]>([])
   const [workflowStatus, setWorkflowStatus] = useState('')
   const [workflowState, setWorkflowState] = useState<WorkflowDisplayState>('idle')
-  const [refreshKey, setRefreshKey] = useState(0)
+  const {
+    pendingChanges,
+    setPendingChanges,
+    pendingChangesRef,
+    refreshKey,
+    setRefreshKey,
+    handleApprove,
+    handleReject,
+    handleRevise,
+  } = usePendingChanges({ projectId, workflowState, setWorkflowState, setWorkflowStatus })
   const [activeTab, setActiveTab] = useState<RightPanelTab>('chat')
   const [agentDecision, setAgentDecision] = useState<AgentDecision | null>(null)
   const [showSettingsMenu, setShowSettingsMenu] = useState(false)
@@ -145,20 +161,26 @@ export function AgentChat({ projectId }: Props) {
     const initSession = async () => {
       try {
         const sessionsRes = await fetch(`/api/agent/${projectId}/sessions`)
+        if (!sessionsRes.ok) throw new Error(await readResponseError(sessionsRes, '会话列表加载失败'))
         const sessions = await sessionsRes.json()
         let activeSession = Array.isArray(sessions) && sessions.length > 0 ? sessions[0] : null
         if (!activeSession) {
           const res = await fetch(`/api/agent/${projectId}/sessions`, { method: 'POST' })
+          if (!res.ok) throw new Error(await readResponseError(res, '新建会话失败'))
           activeSession = await res.json()
         }
         setSessionId(activeSession.id)
         const messagesRes = await fetch(`/api/agent/${projectId}/sessions/${activeSession.id}/messages`)
+        if (!messagesRes.ok) throw new Error(await readResponseError(messagesRes, '会话消息加载失败'))
         const savedMessages = await messagesRes.json()
         if (Array.isArray(savedMessages)) {
           setMessages(savedMessages.map(normalizeSavedMessage))
           if (savedMessages.length > 0) setActiveTab('chat')
         }
-      } catch {}
+      } catch (e) {
+        setWorkflowState('failed')
+        setWorkflowStatus(e instanceof Error ? e.message : '会话初始化失败')
+      }
     }
     if (!sessionId) initSession()
   }, [projectId, sessionId, setMessages, setSessionId])
@@ -172,34 +194,6 @@ export function AgentChat({ projectId }: Props) {
       prevMsgCountRef.current = count
     }
   }, [messages.length, activeTab])
-
-  useEffect(() => {
-    const handler = () => setRefreshKey(k => k + 1)
-    window.addEventListener(WORKSPACE_REFRESH_EVENT, handler)
-    return () => window.removeEventListener(WORKSPACE_REFRESH_EVENT, handler)
-  }, [])
-
-  // 加载待审批变更（从数据库）
-  useEffect(() => {
-    const fetchPending = async () => {
-      try {
-        const res = await fetch(`/api/agent/${projectId}/pending-changes`)
-        const data = await res.json()
-        if (Array.isArray(data)) {
-          setPendingChanges(data)
-          if (data.length === 0) {
-            useEditorStore.getState().setDiffMode(null)
-            // 如果没有待审批变更，清除 pending_approval 状态
-            if (workflowState === 'pending_approval') {
-              setWorkflowState('completed')
-              setWorkflowStatus('所有变更已处理')
-            }
-          }
-        }
-      } catch {}
-    }
-    fetchPending()
-  }, [projectId, refreshKey])
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -253,6 +247,21 @@ export function AgentChat({ projectId }: Props) {
     ws.onerror = () => failActiveRequest('连接失败，请检查后端服务或网络后重试。')
     wsRef.current = ws
   }, [projectId, sessionId, setIsLoading, updateLastModelMessage])
+
+  const { questionnaire, setQuestionnaire, handleQuestionnaireSubmit } = useAgentQuestionnaire({
+    projectId,
+    sessionId,
+    activeFilePath,
+    wsRef,
+    loadingTimerRef,
+    turnCounterRef,
+    connectWs,
+    addMessage,
+    setIsLoading,
+    setWorkflowState,
+    setWorkflowStatus,
+    updateLastModelMessage,
+  })
 
   const handleWsMessage = (data: Record<string, unknown>) => {
     switch (data.type) {
@@ -404,18 +413,25 @@ export function AgentChat({ projectId }: Props) {
     }
   }
 
-  const handleSend = () => {
-    if (!input.trim() || isLoading) return
+  const startAgentRun = (message: string, options: { addUserMessage?: boolean; reuseLastUser?: boolean } = {}) => {
+    const text = message.trim()
+    if (!text || isLoading || !sessionId) return
     turnCounterRef.current++
 
-    const userMsg: ChatMessage = {
-      id: Date.now().toString(),
-      role: 'user',
-      content: input,
-      timestamp: Date.now(),
+    if (options.reuseLastUser && wsRef.current) {
+      wsRef.current.close()
+      wsRef.current = null
     }
-    addMessage(userMsg)
-    setInput('')
+
+    if (options.addUserMessage) {
+      addMessage({
+        id: Date.now().toString(),
+        role: 'user',
+        content: text,
+        timestamp: Date.now(),
+      })
+    }
+
     addMessage({
       id: (Date.now() + 1).toString(),
       role: 'model',
@@ -432,12 +448,19 @@ export function AgentChat({ projectId }: Props) {
     loadingTimerRef.current = setTimeout(() => {
       setIsLoading(false)
       setWorkflowState('failed')
+      setWorkflowStatus('响应超时，请重试。')
       updateLastModelMessage(useChatStore.getState().messages.at(-1)?.content || '（响应超时，请重试）')
     }, 300000)
 
     const sendChat = () => {
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'chat', message: userMsg.content, active_file_path: activeFilePath || '', turn_id: turnCounterRef.current }))
+        wsRef.current.send(JSON.stringify({
+          type: 'chat',
+          message: text,
+          active_file_path: activeFilePath || '',
+          turn_id: turnCounterRef.current,
+          reuse_last_user: !!options.reuseLastUser,
+        }))
       }
     }
 
@@ -470,91 +493,11 @@ export function AgentChat({ projectId }: Props) {
     }
   }
 
-  const handleApprove = async (changeId: string) => {
-    // 确认对话框防止意外批准
-    const change = pendingChanges.find(c => c.id === changeId)
-    if (!confirm(`确定批准变更？\n文件: ${change?.file_path || '未知'}`)) {
-      return
-    }
-    try {
-      const res = await fetch(`/api/agent/${projectId}/pending-changes/${changeId}/approve`, { method: 'POST' })
-      if (res.ok || res.status === 404) {
-        // 404 说明已经被批准过了
-        const filePath = change?.file_path || ''
-        emitFileUpdated(filePath)
-        emitKnowledgeUpdated()
-        setPendingChanges(prev => {
-          const remaining = prev.filter(c => c.id !== changeId)
-          if (remaining.length === 0) {
-            setWorkflowStatus('所有变更已批准')
-            setWorkflowState('completed')
-          } else {
-            setWorkflowStatus(`还有 ${remaining.length} 个待审批变更`)
-            setWorkflowState('pending_approval')
-          }
-          return remaining
-        })
-        if (useEditorStore.getState().activePendingChange?.id === changeId) {
-          useEditorStore.getState().setDiffMode(null)
-        }
-      } else {
-        const data = await res.json().catch(() => ({}))
-        setWorkflowStatus(`批准失败: ${data.detail || data.error || '未知错误'}`)
-        setWorkflowState('failed')
-      }
-    } catch (e) {
-      console.error('[approve] error:', e)
-    }
-  }
-
-  const handleReject = async (changeId: string) => {
-    try {
-      const res = await fetch(`/api/agent/${projectId}/pending-changes/${changeId}/reject`, { method: 'POST' })
-      if (res.ok || res.status === 404) {
-        // 404 说明已经被拒绝过了
-        emitPendingUpdated('pending-rejected')
-        setPendingChanges(prev => {
-          const remaining = prev.filter(c => c.id !== changeId)
-          if (remaining.length === 0) {
-            setWorkflowStatus('所有变更已处理')
-            setWorkflowState('completed')
-          } else {
-            setWorkflowStatus(`还有 ${remaining.length} 个待审批变更`)
-            setWorkflowState('pending_approval')
-          }
-          return remaining
-        })
-        if (useEditorStore.getState().activePendingChange?.id === changeId) {
-          useEditorStore.getState().setDiffMode(null)
-        }
-      } else {
-        const data = await res.json().catch(() => ({}))
-        setWorkflowStatus(`拒绝失败: ${data.detail || data.error || '未知错误'}`)
-        setWorkflowState('failed')
-      }
-    } catch (e) {
-      console.error('[reject] error:', e)
-    }
-  }
-
-  const handleRevise = async (changeId: string, newContent: string, description: string) => {
-    const res = await fetch(`/api/agent/${projectId}/pending-changes/${changeId}/revise`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ new_content: newContent, description }),
-    })
-    const data = await res.json()
-    if (res.ok) {
-      const revised = data as PendingChange
-      setPendingChanges(prev => prev.map(c => c.id === changeId ? revised : c))
-      useEditorStore.getState().setDiffMode(revised)
-      setWorkflowStatus('变更已修订，等待审批')
-      setWorkflowState('pending_approval')
-      emitPendingUpdated('pending-revised')
-    } else {
-      setWorkflowStatus(`修订失败: ${data.detail || data.error || '未知错误'}`)
-      setWorkflowState('failed')
-    }
+  const handleSend = () => {
+    if (!input.trim() || isLoading) return
+    const text = input.trim()
+    setInput('')
+    startAgentRun(text, { addUserMessage: true })
   }
 
   const handleWorkflowStatus = (status: string) => {
@@ -570,21 +513,29 @@ export function AgentChat({ projectId }: Props) {
   const fetchSessions = async () => {
     try {
       const res = await fetch(`/api/agent/${projectId}/sessions`)
+      if (!res.ok) throw new Error(await readResponseError(res, '会话列表加载失败'))
       const data = await res.json()
       if (Array.isArray(data)) setSessions(data)
-    } catch {}
+    } catch (e) {
+      setWorkflowState('failed')
+      setWorkflowStatus(e instanceof Error ? e.message : '会话列表加载失败')
+    }
   }
 
   const handleNewSession = async () => {
     try {
       const res = await fetch(`/api/agent/${projectId}/sessions`, { method: 'POST' })
+      if (!res.ok) throw new Error(await readResponseError(res, '新建会话失败'))
       const data = await res.json()
       if (data.id) {
         handleSwitchSession(data.id)
         addSession({ id: data.id, title: data.title, last_modified: Date.now() })
         setShowSessionList(false)
       }
-    } catch {}
+    } catch (e) {
+      setWorkflowState('failed')
+      setWorkflowStatus(e instanceof Error ? e.message : '新建会话失败')
+    }
   }
 
   const handleSwitchSession = async (newSessionId: string) => {
@@ -604,14 +555,19 @@ export function AgentChat({ projectId }: Props) {
 
     try {
       const res = await fetch(`/api/agent/${projectId}/sessions/${newSessionId}/messages`)
+      if (!res.ok) throw new Error(await readResponseError(res, '会话消息加载失败'))
       const saved = await res.json()
       if (Array.isArray(saved)) setMessages(saved.map(normalizeSavedMessage))
-    } catch {}
+    } catch (e) {
+      setWorkflowState('failed')
+      setWorkflowStatus(e instanceof Error ? e.message : '会话切换失败')
+    }
   }
 
   const handleDeleteSession = async (id: string) => {
     try {
-      await fetch(`/api/agent/${projectId}/sessions/${id}`, { method: 'DELETE' })
+      const res = await fetch(`/api/agent/${projectId}/sessions/${id}`, { method: 'DELETE' })
+      if (!res.ok) throw new Error(await readResponseError(res, '删除会话失败'))
       removeSession(id)
       if (id === sessionId) {
         const remaining = sessions.filter(s => s.id !== id)
@@ -621,7 +577,10 @@ export function AgentChat({ projectId }: Props) {
           handleNewSession()
         }
       }
-    } catch {}
+    } catch (e) {
+      setWorkflowState('failed')
+      setWorkflowStatus(e instanceof Error ? e.message : '删除会话失败')
+    }
   }
 
   const handleRenameSession = async (id: string) => {
@@ -629,13 +588,17 @@ export function AgentChat({ projectId }: Props) {
     if (!trimmed) { setEditingSessionId(null); return }
     if (trimmed === sessions.find(s => s.id === id)?.title) { setEditingSessionId(null); return }
     try {
-      await fetch(`/api/agent/${projectId}/sessions/${id}`, {
+      const res = await fetch(`/api/agent/${projectId}/sessions/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: trimmed }),
       })
+      if (!res.ok) throw new Error(await readResponseError(res, '重命名会话失败'))
       updateSessionTitle(id, trimmed)
-    } catch {}
+    } catch (e) {
+      setWorkflowState('failed')
+      setWorkflowStatus(e instanceof Error ? e.message : '重命名会话失败')
+    }
     setEditingSessionId(null)
   }
 
@@ -650,78 +613,36 @@ export function AgentChat({ projectId }: Props) {
     setEditMsgText(msg.content)
   }
 
-  const handleSaveEdit = () => {
-    if (!editingMsgId || !editMsgText.trim()) return
-    turnCounterRef.current++
+  const handleSaveEdit = async () => {
+    if (!editingMsgId || !editMsgText.trim() || !sessionId) return
     const idx = messages.findIndex(m => m.id === editingMsgId)
     if (idx === -1) { setEditingMsgId(null); return }
 
     const newText = editMsgText.trim()
-    // 保留编辑后的消息，删除后续所有消息（同时从数据库删除）
+    try {
+      await fetch(`/api/agent/${projectId}/sessions/${sessionId}/messages/${editingMsgId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: newText }),
+      })
+      await fetch(`/api/agent/${projectId}/sessions/${sessionId}/messages/${editingMsgId}/truncate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inclusive: false }),
+      })
+    } catch {
+      setWorkflowState('failed')
+      setWorkflowStatus('消息编辑保存失败，请重试。')
+      return
+    }
+
     const newMsgs = messages.slice(0, idx + 1).map((m, i) =>
       i === idx ? { ...m, content: newText } : m
     )
-    // 从数据库删除后续消息
-    for (let i = idx + 1; i < messages.length; i++) {
-      fetch(`/api/agent/${projectId}/sessions/${sessionId}/messages/${messages[i].id}`, { method: 'DELETE' }).catch(() => {})
-    }
     setMessages(newMsgs)
     setEditingMsgId(null)
     setEditMsgText('')
-
-    // 通过 WebSocket 重新发送
-    setIsLoading(true)
-    setWorkflowState('running')
-    setToolCalls([])
-    setAgentDecision(null)
-
-    addMessage({
-      id: (Date.now() + 1).toString(),
-      role: 'model',
-      content: '',
-      timestamp: Date.now(),
-    })
-
-    if (loadingTimerRef.current) clearTimeout(loadingTimerRef.current)
-    loadingTimerRef.current = setTimeout(() => {
-      setIsLoading(false)
-      setWorkflowState('failed')
-      updateLastModelMessage(useChatStore.getState().messages.at(-1)?.content || '（响应超时，请重试）')
-    }, 300000)
-
-    const sendChat = () => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'chat', message: newText, active_file_path: activeFilePath || '', turn_id: turnCounterRef.current }))
-      }
-    }
-
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      connectWs()
-      let check: ReturnType<typeof setInterval>
-      const connectTimeout = setTimeout(() => {
-        clearInterval(check)
-        if (wsRef.current && wsRef.current.readyState !== WebSocket.OPEN) {
-          wsRef.current.close()
-          wsRef.current = null
-        }
-        if (useChatStore.getState().isLoading) {
-          if (loadingTimerRef.current) { clearTimeout(loadingTimerRef.current); loadingTimerRef.current = null }
-          setIsLoading(false)
-          setWorkflowState('failed')
-          setWorkflowStatus('连接超时，请确认后端服务正在运行。')
-          updateLastModelMessage('连接超时，请确认后端服务正在运行后重试。')
-        }
-      }, 10000)
-      check = setInterval(() => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          clearInterval(check)
-          clearTimeout(connectTimeout)
-          sendChat()
-        }
-      }, 100)
-    } else {
-      sendChat()
-    }
+    startAgentRun(newText, { reuseLastUser: true })
   }
 
   const handleCancelEdit = () => {
@@ -729,94 +650,46 @@ export function AgentChat({ projectId }: Props) {
     setEditMsgText('')
   }
 
-  const handleDeleteMessage = (msgId: string) => {
+  const handleDeleteMessage = async (msgId: string) => {
+    if (!sessionId) return
     const idx = messages.findIndex(m => m.id === msgId)
     if (idx === -1) return
-    const msg = messages[idx]
-    const toDeleteIds: string[] = [msgId]
-    if (msg.role === 'model') {
-      // AI 消息：删除自身及后续所有消息
-      for (let i = idx + 1; i < messages.length; i++) toDeleteIds.push(messages[i].id)
+    try {
+      await fetch(`/api/agent/${projectId}/sessions/${sessionId}/messages/${msgId}/truncate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inclusive: true }),
+      })
       removeMessagesFrom(msgId)
-    } else {
-      // 用户消息：删除自身，如果下一条是 AI 回复也一并删除
-      const next = messages[idx + 1]
-      if (next && next.role === 'model') toDeleteIds.push(next.id)
-      const newMsgs = messages.filter((_, i) => i !== idx && (next && next.role === 'model' ? i !== idx + 1 : true))
-      setMessages(newMsgs)
-    }
-    for (const id of toDeleteIds) {
-      fetch(`/api/agent/${projectId}/sessions/${sessionId}/messages/${id}`, { method: 'DELETE' }).catch(() => {})
+    } catch {
+      setWorkflowState('failed')
+      setWorkflowStatus('删除消息失败，请重试。')
     }
   }
 
-  const handleRegenerateMessage = (msgId: string) => {
+  const handleRegenerateMessage = async (msgId: string) => {
+    if (!sessionId) return
     const idx = messages.findIndex(m => m.id === msgId)
     if (idx === -1) return
-    turnCounterRef.current++
-    // 删除该 AI 消息及后续所有消息
-    removeMessagesFrom(msgId)
     // 找到最后一条用户消息并重新发送
     const lastUserMsg = [...messages].slice(0, idx).reverse().find(m => m.role === 'user')
     if (!lastUserMsg) return
+    try {
+      await fetch(`/api/agent/${projectId}/sessions/${sessionId}/messages/${lastUserMsg.id}/truncate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inclusive: false }),
+      })
+    } catch {
+      setWorkflowState('failed')
+      setWorkflowStatus('重新生成前清理历史失败，请重试。')
+      return
+    }
 
     // 构建新的消息列表（保留到最后一条用户消息）
     const userIdx = messages.findIndex(m => m.id === lastUserMsg.id)
     setMessages(messages.slice(0, userIdx + 1))
-
-    // 通过 WebSocket 重新发送
-    setIsLoading(true)
-    setWorkflowState('running')
-    setToolCalls([])
-    setAgentDecision(null)
-
-    addMessage({
-      id: (Date.now() + 1).toString(),
-      role: 'model',
-      content: '',
-      timestamp: Date.now(),
-    })
-
-    if (loadingTimerRef.current) clearTimeout(loadingTimerRef.current)
-    loadingTimerRef.current = setTimeout(() => {
-      setIsLoading(false)
-      setWorkflowState('failed')
-      updateLastModelMessage(useChatStore.getState().messages.at(-1)?.content || '（响应超时，请重试）')
-    }, 300000)
-
-    const sendChat = () => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'chat', message: lastUserMsg.content, active_file_path: activeFilePath || '', turn_id: turnCounterRef.current }))
-      }
-    }
-
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      connectWs()
-      let check: ReturnType<typeof setInterval>
-      const connectTimeout = setTimeout(() => {
-        clearInterval(check)
-        if (wsRef.current && wsRef.current.readyState !== WebSocket.OPEN) {
-          wsRef.current.close()
-          wsRef.current = null
-        }
-        if (useChatStore.getState().isLoading) {
-          if (loadingTimerRef.current) { clearTimeout(loadingTimerRef.current); loadingTimerRef.current = null }
-          setIsLoading(false)
-          setWorkflowState('failed')
-          setWorkflowStatus('连接超时，请确认后端服务正在运行。')
-          updateLastModelMessage('连接超时，请确认后端服务正在运行后重试。')
-        }
-      }, 10000)
-      check = setInterval(() => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          clearInterval(check)
-          clearTimeout(connectTimeout)
-          sendChat()
-        }
-      }, 100)
-    } else {
-      sendChat()
-    }
+    startAgentRun(lastUserMsg.content, { reuseLastUser: true })
   }
 
   const toolDisplayName: Record<string, string> = {
@@ -1010,16 +883,7 @@ export function AgentChat({ projectId }: Props) {
             onInput={setInput}
             onSend={handleSend}
             onCancel={handleCancel}
-            onQuestionnaireSubmit={(answers) => {
-              if (wsRef.current?.readyState === WebSocket.OPEN) {
-                wsRef.current.send(JSON.stringify({
-                  type: 'chat',
-                  message: JSON.stringify({ type: 'questionnaire_answer', answers }),
-                  turn_id: turnCounterRef.current++,
-                }))
-              }
-              setQuestionnaire(null)
-            }}
+            onQuestionnaireSubmit={handleQuestionnaireSubmit}
             onToggleReasoning={toggleReasoning}
             onMouseEnterMsg={setHoveredMsgId}
             onMouseLeaveMsg={() => setHoveredMsgId(null)}
@@ -1166,7 +1030,7 @@ function ChatPane({
 
   return (
     <div style={styles.chatPane}>
-      <div style={styles.messages}>
+      <AgentMessageList>
         {messages.length === 0 && (
           <div style={styles.emptyState}>
             <div style={styles.emptyIcon}>
@@ -1361,7 +1225,7 @@ function ChatPane({
         )}
 
         <div ref={messagesEndRef} />
-      </div>
+      </AgentMessageList>
 
       <AgentInput
         input={input}
@@ -1373,6 +1237,10 @@ function ChatPane({
       />
     </div>
   )
+}
+
+function AgentMessageList({ children }: { children: React.ReactNode }) {
+  return <div style={styles.messages}>{children}</div>
 }
 
 function ActionButton({ icon, title, onClick }: { icon: string; title: string; onClick: () => void }) {

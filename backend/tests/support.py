@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import settings
 from db import database
 from db.database import get_db, init_db
+from core.skills.registry import clear_active_skills
 
 
 class FakeProvider:
@@ -181,6 +182,7 @@ class ProjectTestCase(unittest.IsolatedAsyncioTestCase):
         settings.projects_dir = Path(self.tmp.name)
         settings.api_key = ""
         database._initialized_dbs.clear()
+        clear_active_skills()
         self.project_id = "testproj"
         self.project_dir = settings.projects_dir / self.project_id
         (self.project_dir / ".novelwriter").mkdir(parents=True)
@@ -198,4 +200,5 @@ class ProjectTestCase(unittest.IsolatedAsyncioTestCase):
         settings.projects_dir = self.old_projects_dir
         settings.api_key = self.old_api_key
         database._initialized_dbs.clear()
+        clear_active_skills()
         self.tmp.cleanup()

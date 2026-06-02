@@ -8,6 +8,7 @@ ReAct Agent 引擎 — 对标 NovelIDE 的 useAgentEngine
 4. 特殊工具：final_answer（终止）、reflection（静默）、thinking（静默）
 """
 import json
+import logging
 import re
 import uuid
 from pathlib import Path
@@ -22,11 +23,14 @@ from core.agent.tool_runner import ToolRunner
 from core.tools import get_all_tool_definitions
 from core.skills.trigger import auto_activate_skills
 from core.skills.registry import activate_skill, build_skills_context, get_active_skill_names
+from core.skills.project_state import hydrate_project_skills
 from ai.compat import friendly_api_error
 from ai.provider import AIProvider
 from ai.model_router import detect_task_type, get_model_config
 from core.agent.reasoning import split_model_output
 from utils.diff import generate_diff
+
+logger = logging.getLogger(__name__)
 
 
 MAX_ITERATIONS = 90
@@ -38,6 +42,15 @@ INTERNAL_TOOL_NAMES = {"reflection", "thinking"}
 _RAW_TOOL_CALL_RE = re.compile(
     r'\{"tool_calls"\s*:\s*\[.*?\]\s*\}',
     re.DOTALL,
+)
+
+_SHADOW_READ_RE = re.compile(
+    r'✅ 文件\s+"[^"]+"\s+的变更已排队等待用户审批。.*?请继续执行其他任务，假设此变更会被批准。',
+    re.DOTALL,
+)
+
+_COMPACT_TOOL_RESULT_RE = re.compile(
+    r'\s*\{[^{}\n]*"id"\s*:\s*"[^"]+"[^{}\n]*"name"\s*:\s*"[^"]+"[^{}\n]*\}\s*'
 )
 
 
@@ -52,6 +65,19 @@ def _strip_raw_tool_call_json(content: str) -> str:
     if stripped.startswith("{") and '"tool_calls"' in stripped:
         return ""
     return content
+
+
+def _sanitize_user_visible_content(content: str) -> str:
+    """Keep internal tool/shadow-read artifacts out of chat-visible text."""
+    if not content:
+        return content
+    cleaned = _strip_raw_tool_call_json(content)
+    cleaned = _SHADOW_READ_RE.sub("", cleaned)
+    cleaned = _COMPACT_TOOL_RESULT_RE.sub("\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if "待审批内容（Shadow Read）" in cleaned:
+        return ""
+    return cleaned
 
 
 _THINKING_PATTERN = re.compile(
@@ -133,6 +159,8 @@ async def run_agent(
     - {"type": "error", "error": "..."}            错误
     """
     # ─── 1. 识别用户意图并激活技能 ───────────────────────
+    await hydrate_project_skills(project_id)
+
     last_user_msg = ""
     if messages:
         for msg in reversed(messages):
@@ -141,7 +169,7 @@ async def run_agent(
                 break
 
     if last_user_msg:
-        auto_activate_skills(last_user_msg)
+        auto_activate_skills(last_user_msg, scope=project_id)
 
     if last_user_msg and settings.enable_intent_detection:
         try:
@@ -155,7 +183,7 @@ async def run_agent(
             for skill in intent_preview.get("suggested_skills", []):
                 skill_id = skill.get("id")
                 if skill_id:
-                    activate_skill(skill_id)
+                    activate_skill(skill_id, scope=project_id)
             yield {
                 "type": "intent",
                 "turn_id": turn_id,
@@ -186,7 +214,7 @@ async def run_agent(
             for skill in plan.get("active_skills", []):
                 skill_id = skill.get("id")
                 if skill_id:
-                    activate_skill(skill_id)
+                    activate_skill(skill_id, scope=project_id)
             yield {"type": "execution_plan", "turn_id": turn_id, "session_id": session_id, "plan": plan, **plan}
         except Exception as e:
             yield {
@@ -197,12 +225,12 @@ async def run_agent(
             }
 
     # ─── 2. 准备系统提示和上下文 ─────────────────────────
-    active_names = get_active_skill_names()
+    active_names = get_active_skill_names(scope=project_id)
     system_prompt = await build_system_prompt(project_id, project_dir, active_skill_names=active_names)
-    tool_runner = ToolRunner(project_id)
+    tool_runner = ToolRunner(project_id, session_id=session_id)
 
     # 注入激活技能的上下文
-    skills_context = build_skills_context()
+    skills_context = build_skills_context(scope=project_id)
     if skills_context:
         system_prompt = system_prompt + "\n\n" + skills_context
 
@@ -227,6 +255,7 @@ async def run_agent(
     full_messages = compress_messages(full_messages, token_budget=token_budget)
 
     final_content = ""
+    pending_approval_count = 0
 
     # ─── 3. ReAct 循环 ───────────────────────────────────
     for iteration in range(MAX_ITERATIONS):
@@ -238,14 +267,14 @@ async def run_agent(
 
         # 问卷暂停检查：如果有活跃问卷，暂停循环等待用户回答
         from core.tools.questionnaire_tools import has_active_questionnaire, get_active_questionnaire
-        if has_active_questionnaire(project_id):
-            questionnaire = get_active_questionnaire(project_id)
+        if await has_active_questionnaire(project_id, session_id=session_id):
+            questionnaire = await get_active_questionnaire(project_id, session_id=session_id)
             yield {"type": "questionnaire", "questionnaire": questionnaire}
             return
 
         # 调用LLM
         try:
-            active_names = get_active_skill_names()
+            active_names = get_active_skill_names(scope=project_id)
             tool_definitions = get_all_tool_definitions(active_skill_names=active_names)
             openai_tools = _tool_defs_to_openai(tool_definitions)
             _tools_param = openai_tools if openai_tools else None
@@ -256,8 +285,7 @@ async def run_agent(
                 max_tokens=model_config.max_tokens,
             )
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.exception("AI call failed during agent run")
             yield {"type": "error", "error": f"AI调用失败: {friendly_api_error(e)}"}
             return
 
@@ -279,8 +307,9 @@ async def run_agent(
                     })
                     continue
             elif content:
-                final_content = content
-                yield {"type": "delta", "content": content}
+                final_content = _sanitize_user_visible_content(content)
+                if final_content:
+                    yield {"type": "delta", "content": final_content}
                 yield {"type": "done", "content": final_content, "is_partial": True}
                 return
 
@@ -296,12 +325,17 @@ async def run_agent(
             thinking, cleaned_content = _extract_thinking(content)
             if thinking:
                 yield {"type": "thinking", "intent": thinking["intent"], "plan": thinking["plan"], "reflection": thinking["reflection"]}
-            if cleaned_content:
-                final_content = cleaned_content
-                yield {"type": "delta", "content": cleaned_content}
+            if cleaned_content and not tool_calls_data:
+                visible_content = _sanitize_user_visible_content(cleaned_content)
+                if visible_content:
+                    final_content = visible_content
+                    yield {"type": "delta", "content": visible_content}
 
         # 没有工具调用 → 最终回复
         if not tool_calls_data:
+            if not final_content and pending_approval_count:
+                final_content = "已生成待审批变更，请在审批面板查看。"
+                yield {"type": "delta", "content": final_content}
             yield {
                 "type": "done",
                 "content": final_content,
@@ -387,8 +421,9 @@ async def run_agent(
                 else:
                     answer_text = str(result.result) if result.result else ""
                 if answer_text:
-                    final_content = answer_text
-                yield {"type": "delta", "content": final_content}
+                    final_content = _sanitize_user_visible_content(answer_text)
+                if final_content:
+                    yield {"type": "delta", "content": final_content}
                 yield {
                     "type": "done",
                     "content": final_content,
@@ -402,6 +437,7 @@ async def run_agent(
 
             # 处理需要审批的情况 — 乐观继续，不中断推理链
             if result.status == ToolResultStatus.APPROVAL_REQUIRED and result.pending_change:
+                pending_approval_count += 1
                 pc = result.pending_change
                 diff_text = generate_diff(pc.original_content, pc.new_content, pc.file_path)
                 pc_dict = {
@@ -412,6 +448,7 @@ async def run_agent(
                     "diff": diff_text,
                     "original_content": pc.original_content,
                     "new_content": pc.new_content,
+                    "metadata": pc.metadata or {},
                 }
                 yield {"type": "approval_required", "pending_change": pc_dict}
 
@@ -477,7 +514,7 @@ async def run_agent(
                 )
                 summary_content = summary_resp.get("content") or ""
                 summary_content, _ = split_model_output(summary_content)
-                summary_content = _strip_raw_tool_call_json(summary_content)
+                summary_content = _sanitize_user_visible_content(summary_content)
                 if summary_content:
                     final_content = summary_content
                     yield {"type": "delta", "content": final_content}
@@ -485,4 +522,5 @@ async def run_agent(
                 pass
 
     # 超过最大迭代次数
-    yield {"type": "done", "content": final_content or "已达到最大迭代次数，请继续提问。"}
+    fallback_content = "已生成待审批变更，请在审批面板查看。" if pending_approval_count else "已达到最大迭代次数，请继续提问。"
+    yield {"type": "done", "content": _sanitize_user_visible_content(final_content) or fallback_content}

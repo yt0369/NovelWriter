@@ -132,7 +132,7 @@ def get_all_tool_definitions(active_skill_names: set[str] | None = None) -> list
     return [t for t in all_tools if t.function.name in allowed]
 
 
-async def execute_tool(tool_call: ToolCall, project_id: str) -> ToolResult:
+async def execute_tool(tool_call: ToolCall, project_id: str, session_id: str = "") -> ToolResult:
     file_tools = {"read_file", "write_file", "patch_file", "glob", "grep", "delete_file", "rename_file"}
     control_tools = {"thinking", "final_answer"}
     memory_tools = {"query_memory", "manage_memory", "link_memory", "promote_to_shared", "memory_status", "traverse_memory"}
@@ -162,7 +162,7 @@ async def execute_tool(tool_call: ToolCall, project_id: str) -> ToolResult:
     elif tool_call.name in memory_tools:
         return await execute_memory_tool(tool_call, project_id)
     elif tool_call.name in skill_tools:
-        return await execute_skill_tool(tool_call)
+        return await execute_skill_tool(tool_call, scope=project_id)
     elif tool_call.name in timeline_tools:
         return await execute_timeline_tool(tool_call, project_id)
     elif tool_call.name in foreshadowing_tools:
@@ -174,7 +174,7 @@ async def execute_tool(tool_call: ToolCall, project_id: str) -> ToolResult:
     elif tool_call.name in todo_tools_set:
         return await todo_tools.execute(tool_call, project_id)
     elif tool_call.name in questionnaire_tools_set:
-        return await questionnaire_tools.execute(tool_call, project_id)
+        return await questionnaire_tools.execute(tool_call, project_id, session_id=session_id)
     elif tool_call.name in plan_note_tools_set:
         return await plan_note_tools.execute(tool_call, project_id)
     elif tool_call.name in deep_thinking_tools_set:

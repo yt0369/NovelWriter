@@ -7,6 +7,15 @@ from core.skills.registry import (
 )
 
 
+def _ensure_skills_registered():
+    """Load built-in skills for direct engine/tool use outside FastAPI startup."""
+    if get_all_skills():
+        return
+    from core.skills.definitions import register_all_skills
+
+    register_all_skills()
+
+
 def get_skill_tool_definitions() -> list[ToolDefinition]:
     return [
         ToolDefinition(function=ToolFunction(
@@ -25,23 +34,29 @@ def get_skill_tool_definitions() -> list[ToolDefinition]:
     ]
 
 
-async def execute_skill_tool(tool_call: ToolCall) -> ToolResult:
+async def execute_skill_tool(tool_call: ToolCall, scope: str = "") -> ToolResult:
     name = tool_call.name
     args = tool_call.arguments
+    _ensure_skills_registered()
 
     if name == "activate_skill":
         skill_name = args.get("skill_name", "")
         deactivate = args.get("deactivate", False)
 
         if deactivate:
-            deactivate_skill(skill_name)
+            deactivate_skill(skill_name, scope=scope)
             return ToolResult(
                 status=ToolResultStatus.EXECUTED,
                 tool_name=name,
                 result={"action": "deactivated", "skill": skill_name},
             )
 
-        skill = activate_skill(skill_name)
+        skill = activate_skill(skill_name, scope=scope)
+        if not skill:
+            from core.skills.definitions import register_all_skills
+
+            register_all_skills()
+            skill = activate_skill(skill_name, scope=scope)
         if not skill:
             return ToolResult(
                 status=ToolResultStatus.ERROR,
@@ -64,7 +79,7 @@ async def execute_skill_tool(tool_call: ToolCall) -> ToolResult:
 
     elif name == "list_skills":
         skills = get_all_skills()
-        active = {a.skill.name for a in get_active_skills()}
+        active = {a.skill.name for a in get_active_skills(scope=scope)}
         return ToolResult(
             status=ToolResultStatus.EXECUTED,
             tool_name=name,

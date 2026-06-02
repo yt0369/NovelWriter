@@ -1,6 +1,9 @@
 import asyncio
+import logging
 from models.tools import ToolCall, ToolResult, ToolResultStatus
 from core.tools import execute_tool
+
+logger = logging.getLogger(__name__)
 
 # 读取类工具：可并发执行
 READ_TOOLS = frozenset({"read_file", "glob", "grep", "query_memory", "list_characters", "get_character_profile", "list_events", "list_foreshadows", "check_unresolved_foreshadows", "get_outline_structure", "query_evolution"})
@@ -9,8 +12,9 @@ READ_TOOLS = frozenset({"read_file", "glob", "grep", "query_memory", "list_chara
 class ToolRunner:
     """工具执行器，带熔断器和错误追踪。"""
 
-    def __init__(self, project_id: str, max_consecutive_failures: int = 4):
+    def __init__(self, project_id: str, max_consecutive_failures: int = 4, session_id: str = ""):
         self.project_id = project_id
+        self.session_id = session_id
         self.max_consecutive_failures = max_consecutive_failures
         self.consecutive_failures = 0
         self.total_tool_calls = 0
@@ -25,12 +29,12 @@ class ToolRunner:
         self.total_tool_calls += 1
         has_raw = '_raw' in (tool_call.arguments or {})
         args_preview = str(tool_call.arguments)[:150]
-        print(f"[DEBUG] tool_run: {tool_call.name}({args_preview}){' [RAW!]' if has_raw else ''}")
-        result = await execute_tool(tool_call, self.project_id)
+        logger.debug("tool_run: %s(%s)%s", tool_call.name, args_preview, " [RAW!]" if has_raw else "")
+        result = await execute_tool(tool_call, self.project_id, session_id=self.session_id)
 
         if result.status == ToolResultStatus.ERROR:
             error_msg = result.error or ""
-            print(f"[DEBUG] tool_error: {tool_call.name} -> {error_msg}")
+            logger.debug("tool_error: %s -> %s", tool_call.name, error_msg)
 
             # 文件不存在是正常情况（初始化阶段、探索项目结构），不算连续失败
             is_file_not_found = "文件不存在" in error_msg or "不存在" in error_msg
@@ -44,7 +48,7 @@ class ToolRunner:
                     self.consecutive_failures = self.max_consecutive_failures
         else:
             self.consecutive_failures = 0
-            print(f"[DEBUG] tool_ok: {tool_call.name}")
+            logger.debug("tool_ok: %s", tool_call.name)
 
         return result
 
@@ -68,26 +72,15 @@ class ToolRunner:
         return results
 
     async def run_concurrent(self, tool_calls: list[ToolCall]) -> list[ToolResult]:
-        """并发执行工具调用。读取类工具并发，写入类工具串行。"""
+        """并发执行工具调用。
+
+        连续的读取类工具可以并发；写入/审批类工具作为顺序屏障逐个执行。
+        这样既保留读工具吞吐，又避免“写后读”在同一批工具调用中读到旧状态。
+        """
         if not tool_calls:
             return []
 
-        # 分离读取类和写入类工具
-        read_calls = []
-        write_calls = []
-        call_order = []  # 保持原始顺序
-
-        for tc in tool_calls:
-            if tc.name in READ_TOOLS and not self.is_circuit_broken():
-                read_calls.append(tc)
-                call_order.append(("read", len(read_calls) - 1))
-            else:
-                write_calls.append(tc)
-                call_order.append(("write", len(write_calls) - 1))
-
-        # 并发执行所有读取类工具
-        read_results: list[ToolResult] = []
-        if read_calls:
+        async def _run_read_batch(read_calls: list[ToolCall]) -> list[ToolResult]:
             async def _safe_run(tc):
                 if self.is_circuit_broken():
                     return ToolResult(
@@ -97,27 +90,31 @@ class ToolRunner:
                     )
                 return await self.run(tc)
 
-            read_results = list(await asyncio.gather(*[_safe_run(tc) for tc in read_calls]))
+            return list(await asyncio.gather(*[_safe_run(tc) for tc in read_calls]))
 
-        # 串行执行写入类工具
-        write_results: list[ToolResult] = []
-        for tc in write_calls:
+        results: list[ToolResult] = []
+        pending_reads: list[ToolCall] = []
+
+        async def _flush_reads():
+            nonlocal pending_reads
+            if pending_reads:
+                results.extend(await _run_read_batch(pending_reads))
+                pending_reads = []
+
+        for tc in tool_calls:
+            if tc.name in READ_TOOLS:
+                pending_reads.append(tc)
+                continue
+
+            await _flush_reads()
             if self.is_circuit_broken():
-                write_results.append(ToolResult(
+                results.append(ToolResult(
                     status=ToolResultStatus.ERROR,
                     tool_name=tc.name,
                     error="熔断器触发：连续失败次数过多，停止执行",
                 ))
             else:
-                result = await self.run(tc)
-                write_results.append(result)
+                results.append(await self.run(tc))
 
-        # 按原始顺序重组结果
-        results = [None] * len(tool_calls)
-        for i, (kind, idx) in enumerate(call_order):
-            if kind == "read":
-                results[i] = read_results[idx]
-            else:
-                results[i] = write_results[idx]
-
+        await _flush_reads()
         return results
